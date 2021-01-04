@@ -1,0 +1,6 @@
+[submodule "3rdparty/link"]
+	path = 3rdparty/link
+	url = https://github.com/Ableton/link.git
+[submodule "3rdparty/jack"]
+	path = 3rdparty/jack
+	url = https://github.com/jackaudio/headers

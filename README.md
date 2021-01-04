@@ -1,0 +1,66 @@
+# Jack Transport Link
+
+A service that bridges [Ableton's Link](https://github.com/Ableton/link) to and from
+[Jack Transport](https://jackaudio.org/api/transport-design.html), allowing applications
+that use *Jack Transport* to synchronize their timing with other applications that support
+*Link*.
+
+## Build Requirements
+
+* a compiler that can build c++17
+	* clang++, g++
+* [cmake](https://cmake.org/) 3.17 or higher
+* [conan](https://conan.io/)
+	* `pip3 install conan`
+	* make sure the *conan* executable is in your path
+
+## Building
+
+Make sure you've updated your submodules:
+
+```shell
+git submodule update --init --recursive
+```
+
+Use cmake to configure, then build:
+
+```shell
+mkdir build && cd build && cmake .. && make
+```
+
+If everything succeeds, you should have an executable here: `./bin/jack_transport_link`.
+
+## Installing
+
+You can just run from the bin directory if you want, or copy the executable somewhere,
+but you can also use the install target:
+
+```shell
+sudo make install
+```
+
+## Running
+
+There are a few options for running the service, setting the initial tempo
+and time signature details, indicating if you want the service to start a
+jack server if there isn't already one to connect to, etc.
+
+Run with the `-h` switch to discover more details.
+
+## TODO
+
+* Option to synchronize the rolling start to a start of a bar.
+* Windows support
+
+## Acknowledgements
+
+Built using:
+
+* [Ableton's Link](https://github.com/Ableton/link)
+* [Jack Audio Connection Toolkit](https://jackaudio.org/)
+* [cpp-optparse](https://github.com/weisslj/cpp-optparse)
+
+I learned a lot from [jack_link](https://github.com/rncbc/jack_link) by Rui
+Nuno Capela, which is trying to solve the same problem but has a user interface
+and I wanted to simply run as a service. *jack_link* also has some issues with
+discontinuities that I wasn't happy with.
