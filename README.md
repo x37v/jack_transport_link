@@ -39,6 +39,12 @@ but you can also use the install target:
 sudo make install
 ```
 
+Or, on debian systems you can use `cpack` and then install the deb, from the build dir.
+
+```shell
+cpack && sudo dpkg -i *.deb
+```
+
 ## Running
 
 There are a few options for running the service, setting the initial tempo
