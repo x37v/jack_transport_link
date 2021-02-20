@@ -53,6 +53,27 @@ jack server if there isn't already one to connect to, etc.
 
 Run with the `-h` switch to discover more details.
 
+## Notes
+
+Since jack transport doesn't allow clients to request tempo, we use the
+metadata API to do tempo requests.  You must use jack 1.9.13 or newer for
+metadata support.  *NOTE* The transport must be rolling for it to send to Link,
+but you can set the tempo before that, it will be sent to link once you start
+rolling.
+
+The key for bpm is `http://www.x37v.info/jack/metadata/bpm` and the type is `https://www.w3.org/2001/XMLSchema#decimal`.
+
+Here is an example of how to set the tempo to 150 beats per minute.
+
+```shell
+jack_property --client jack-transport-link http://www.x37v.info/jack/metadata/bpm 150.0 https://www.w3.org/2001/XMLSchema#decimal
+```
+
+To get the current bpm property.
+```shell
+jack_property --client jack-transport-link --list http://www.x37v.info/jack/metadata/bpm
+```
+
 ## TODO
 
 * Option to synchronize the rolling start to a start of a bar.
