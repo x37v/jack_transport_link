@@ -4,10 +4,19 @@
 #include <csignal>
 #include <OptionParser.h>
 
+#include <iostream>
+
 //TODO windows?
 std::atomic<bool> run = true;
 void signal_handler(int signal) {
   run.store(false);
+}
+
+//the current session (server instance)
+std::atomic<bool> runSession = true;
+void shutdown_handler(void*) {
+  std::cout << "shutdown" << std::endl;
+  runSession.store(false);
 }
 
 int main(int argc, char * argv[]) {
@@ -101,6 +110,8 @@ int main(int argc, char * argv[]) {
     jack_status_t status;
     auto client = jack_client_open(name.c_str(), jackOptions, &status);
     if (client != nullptr) {
+      runSession.store(true);
+      jack_on_shutdown(client, shutdown_handler, nullptr);
       JackTransportLink j(
           client,
           enableStartStopSync,
@@ -109,7 +120,7 @@ int main(int argc, char * argv[]) {
           initialTimeSigDenom,
           initialTicksPerBeat
           );
-      while (run.load()) {
+      while (run.load() && runSession.load()) {
         std::this_thread::sleep_for(runPollPeriod);
       }
     } else {
