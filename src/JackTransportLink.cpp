@@ -111,7 +111,7 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
     if (mRequestPosition) {
       double quantum = bbtValid ? pos.beats_per_bar : mInitialQuantum;
       //request position
-      double linkBeat = static_cast<double>(pos->bar - 1) * quantum
+      double linkBeat = static_cast<double>(pos.bar - 1) * quantum
         + static_cast<double>(pos.beat - 1)
         + static_cast<double>(pos.tick) / pos.ticks_per_beat;
       //TODO offset time based on bbtOffset?
