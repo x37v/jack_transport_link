@@ -57,9 +57,7 @@ Run with the `-h` switch to discover more details.
 
 Since jack transport doesn't allow clients to request tempo, we use the
 metadata API to do tempo requests.  You must use jack 1.9.13 or newer for
-metadata support.  *NOTE* The transport must be rolling for it to send to Link,
-but you can set the tempo before that, it will be sent to link once you start
-rolling.
+metadata support. You can request the tempo even if the transport isn't running.
 
 The key for bpm is `http://www.x37v.info/jack/metadata/bpm` and the type is `https://www.w3.org/2001/XMLSchema#decimal`.
 
