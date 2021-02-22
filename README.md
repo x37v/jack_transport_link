@@ -74,6 +74,8 @@ jack_property --client jack-transport-link --list http://www.x37v.info/jack/meta
 
 ## TODO
 
+* Latency Compensation computation
+* Follower mode (just report transport, don't drive it)
 * Option to synchronize the rolling start to a start of a bar.
 * Windows support
 
