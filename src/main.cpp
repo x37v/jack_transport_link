@@ -25,20 +25,32 @@ int main(int argc, char * argv[]) {
 
   //setup options
   auto parser = optparse::OptionParser().description("Jack Transport Link");
+  parser.set_defaults("start_stop_sync", "1");
+  parser.set_defaults("start_server", "0");
+
   parser
     .add_option("-s", "--start-stop-sync")
-    .type("bool")
-    .help("synchronize starts and stops with other start/stop enabled link clients, default: %default")
-    .action("store")
-    .dest("start_stop_sync")
-    .set_default("true");
+    .help("synchronize starts and stops with other start/stop enabled link clients")
+    .action("store_true")
+    .dest("start_stop_sync");
+  parser
+    .add_option("-S", "--no-start-stop-sync")
+    .help("do not synchronize starts and stops with other start/stop enabled link client")
+    .action("store_false")
+    .dest("start_stop_sync");
+
   parser
     .add_option("-j", "--start-server")
-    .type("bool")
-    .help("start the jack server if it isn't already running, default: %default")
-    .action("store")
-    .dest("start_server")
-    .set_default("false");
+    .help("start the jack server if it isn't already running")
+    .action("store_true")
+    .dest("start_server");
+
+  parser
+    .add_option("-J", "--no-start-server")
+    .help("do not start the jack server if it isn't already running")
+    .action("store_false")
+    .dest("start_server");
+
   parser
     .add_option("-p", "--server-poll-period")
     .type("int")
