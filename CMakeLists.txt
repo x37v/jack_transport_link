@@ -96,6 +96,7 @@ if (LINUX)
     SET(CPACK_PACKAGE_DESCRIPTION_SUMMARY "A service that bridges Ableton's Link to and from Jack Transport.")
     SET(CPACK_PACKAGE_VENDOR "Alex Norman")
     SET(CPACK_PACKAGE_CONTACT "alex@x37v.info")
+    SET(CPACK_DEBIAN_PACKAGE_HOMEPAGE "https://github.com/x37v/jack_transport_link")
 
     SET(CPACK_DEBIAN_PACKAGE_VERSION "${PROJECT_VERSION}")
 
@@ -114,9 +115,10 @@ if (LINUX)
 		SET(CPACK_DEB_COMPONENT_INSTALL ON)
 		SET(CPACK_COMPONENTS_GROUPING "ALL_COMPONENTS_IN_ONE")
 
+    set(CPACK_DEBIAN_PACKAGE_CONTROL_EXTRA "${CMAKE_CURRENT_SOURCE_DIR}/debian/copyright")
     if (INSTALL_SERVICE_FILE)
       set(CPACK_DEBIAN_PACKAGE_CONTROL_EXTRA
-        "${CMAKE_CURRENT_SOURCE_DIR}/debian/prerm;${CMAKE_CURRENT_SOURCE_DIR}/debian/postrm;${CMAKE_CURRENT_SOURCE_DIR}/debian/postinst;${CMAKE_CURRENT_SOURCE_DIR}/debian/conffiles")
+        "${CPACK_DEBIAN_PACKAGE_CONTROL_EXTRA};${CMAKE_CURRENT_SOURCE_DIR}/debian/prerm;${CMAKE_CURRENT_SOURCE_DIR}/debian/postrm;${CMAKE_CURRENT_SOURCE_DIR}/debian/postinst;${CMAKE_CURRENT_SOURCE_DIR}/debian/conffiles")
     endif()
 
     INCLUDE(CPack)
