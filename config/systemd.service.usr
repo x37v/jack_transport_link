@@ -1,0 +1,21 @@
+[Unit]
+  Description=Jack Transport Link
+  After=multi-user.target
+  StartLimitIntervalSec=500
+  StartLimitBurst=5
+
+[Service]
+  Type=idle
+  ExecStart=/usr/bin/jack_transport_link
+  KillSignal=SIGINT
+  User=pi
+  Group=audio
+  LimitRTPRIO=infinity
+  LimitMEMLOCK=infinity
+  Environment="JACK_NO_AUDIO_RESERVATION=1"
+  Restart=on-failure
+  RestartSec=5s
+
+[Install]
+  WantedBy=multi-user.target
+  Alias=jack_transport_link

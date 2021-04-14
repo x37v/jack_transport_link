@@ -9,6 +9,8 @@ project(jack_transport_link
 set(CMAKE_CXX_STANDARD 17)
 set(PROJECT_APP "jack_transport_link")
 
+set(INSTALL_SERVICE_FILE OFF CACHE BOOL "Should we install a service file")
+
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Debug CACHE STRING "Choose the type of build, options are: Debug Release" FORCE)
 endif()
@@ -45,7 +47,6 @@ include(3rdparty/link/AbletonLinkConfig.cmake)
 
 include_directories(
   ./src/
-  ./3rdparty/
   ./3rdparty/link/include/
   ${cpp-optparse_INCLUDE_DIRS}
 )
@@ -67,6 +68,24 @@ target_link_libraries(${PROJECT_APP} ${cpp-optparse_LIBS} ${JACK_LIB} ${PLATFORM
 install(TARGETS ${PROJECT_APP} DESTINATION bin)
 
 if (LINUX)
+
+  if (INSTALL_SERVICE_FILE)
+    install(FILES
+      ${CMAKE_CURRENT_SOURCE_DIR}/config/systemd.service.local
+      RENAME "${PROJECT_APP}.service"
+      DESTINATION lib/systemd/system/
+      COMPONENT local
+    )
+
+    install(FILES
+      ${CMAKE_CURRENT_SOURCE_DIR}/config/systemd.service.usr
+      RENAME "${PROJECT_APP}.service"
+      DESTINATION lib/systemd/system/
+      COMPONENT usr
+      EXCLUDE_FROM_ALL
+    )
+  endif()
+
   #setup deb build
   IF(EXISTS "${CMAKE_ROOT}/Modules/CPack.cmake")
     INCLUDE(InstallRequiredSystemLibraries)
@@ -88,9 +107,18 @@ if (LINUX)
     SET(CPACK_DEBIAN_PACKAGE_PRIORITY "optional")
     SET(CPACK_DEBIAN_PACKAGE_SECTION "sound")
 
-    #		set(CPACK_DEBIAN_PACKAGE_CONTROL_EXTRA
-    #			"${CMAKE_CURRENT_SOURCE_DIR}/debian/prerm;${CMAKE_CURRENT_SOURCE_DIR}/debian/postrm;${CMAKE_CURRENT_SOURCE_DIR}/debian/postinst;${CMAKE_CURRENT_SOURCE_DIR}/debian/conffiles")
-    #
+		#remove the local component from the deb as it references /usr/ not /usr/local/
+		get_cmake_property(CPACK_COMPONENTS_ALL COMPONENTS)
+		message(STATUS "components ${CPACK_COMPONENTS_ALL}")
+		list(REMOVE_ITEM CPACK_COMPONENTS_ALL "local")
+		SET(CPACK_DEB_COMPONENT_INSTALL ON)
+		SET(CPACK_COMPONENTS_GROUPING "ALL_COMPONENTS_IN_ONE")
+
+    if (INSTALL_SERVICE_FILE)
+      set(CPACK_DEBIAN_PACKAGE_CONTROL_EXTRA
+        "${CMAKE_CURRENT_SOURCE_DIR}/debian/prerm;${CMAKE_CURRENT_SOURCE_DIR}/debian/postrm;${CMAKE_CURRENT_SOURCE_DIR}/debian/postinst;${CMAKE_CURRENT_SOURCE_DIR}/debian/conffiles")
+    endif()
+
     INCLUDE(CPack)
   ENDIF(EXISTS "${CMAKE_ROOT}/Modules/CPack.cmake")
 endif()
