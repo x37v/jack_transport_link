@@ -42,7 +42,7 @@ conan_cmake_install(PATH_OR_REFERENCE .
 
 find_package(cpp-optparse REQUIRED)
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(JACK jack>=1.9.12)
+pkg_check_modules(JACK jack>=1.9.12 REQUIRED IMPORTED_TARGET)
 
 include(3rdparty/link/AbletonLinkConfig.cmake)
 
@@ -68,9 +68,9 @@ add_executable(${PROJECT_APP}
 target_link_libraries(
   ${PROJECT_APP}
   ${cpp-optparse_LIBS}
-  ${JACK_LIBS}
   ${PLATFORM_LIBS}
   Ableton::Link
+  PkgConfig::JACK
 )
 
 install(TARGETS ${PROJECT_APP} DESTINATION bin)
