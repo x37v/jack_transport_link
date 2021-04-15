@@ -33,6 +33,7 @@ class JackTransportLink {
     int syncCallback(jack_transport_state_t state, jack_position_t *pos);
     void propertyChangeCallback(jack_uuid_t subject, const char *key, jack_property_change_t change);
     void setBPMProperty(double bpm);
+    void setEnableStartStopProperty(bool enable);
 
     jack_client_t * mJackClient;
     ableton::Link mLink;
