@@ -1,10 +1,30 @@
 #include "JackTransportLink.hpp"
 
 #include <jack/uuid.h>
+#include <string>
 
 namespace {
   const char * decimal_type = "https://www.w3.org/2001/XMLSchema#decimal";
-  const std::string(bpm_key) = "http://www.x37v.info/jack/metadata/bpm";
+  const char * bool_type = "https://www.w3.org/2001/XMLSchema#boolean";
+  const std::string bpm_key("http://www.x37v.info/jack/metadata/bpm");
+  const std::string start_stop_key("http://www.x37v.info/jack/metadata/link/start-stop-sync");
+  const std::array<std::string, 2> true_values = { "true", "1" };
+
+  //helper to deal with dealloc and std::string
+  bool get_property(jack_uuid_t subject, const std::string& key, std::string& value_out, std::string& type_out) {
+      char * values = nullptr;
+      char * types = nullptr;
+      if (jack_get_property(subject, key.c_str(), &values, &types) != 0)
+        return false;
+      value_out = std::string(values);
+      type_out = std::string(type_out);
+      if (values)
+        jack_free(values);
+      if (types)
+        jack_free(types);
+      return true;
+  }
+
 }
 
 JackTransportLink::JackTransportLink(
@@ -32,11 +52,13 @@ JackTransportLink::JackTransportLink(
   });
   if (enableStartStopSync) {
     mLink.setStartStopCallback([this](bool isPlaying) {
+      if (mLink.isStartStopSyncEnabled()) {
         if (isPlaying) {
           jack_transport_start(mJackClient);
         } else {
           jack_transport_stop(mJackClient);
         }
+      }
     });
   }
   mLink.enableStartStopSync(enableStartStopSync);
@@ -49,6 +71,7 @@ JackTransportLink::JackTransportLink(
     if ((uuids = jack_get_uuid_for_client_name(mJackClient, jack_get_client_name(mJackClient))) != nullptr
         && jack_uuid_parse(uuids, &mJackClientUUID) == 0) {
       setBPMProperty(mBPM.load(std::memory_order_acquire));
+      setEnableStartStopProperty(mLink.isStartStopSyncEnabled());
       jack_set_property_change_callback(mJackClient, JackTransportLink::propertyChangeCallback, this);
     }
   }
@@ -177,24 +200,28 @@ void JackTransportLink::propertyChangeCallback(jack_uuid_t subject, const char *
 
 void JackTransportLink::propertyChangeCallback(jack_uuid_t subject, const char *key, jack_property_change_t change) {
   //if the subject is all or us and the key is all (empty) or bpm
-  if ((jack_uuid_empty(subject) || subject == mJackClientUUID) && (!key || bpm_key.compare(key) == 0)) {
+  if ((jack_uuid_empty(subject) || subject == mJackClientUUID)) {
+    bool bpm = !key || bpm_key.compare(key) == 0;
+    bool enable = !key || start_stop_key.compare(key) == 0;
     if (change == jack_property_change_t::PropertyChanged) {
-      char * values = nullptr;
-      char * types = nullptr;
-      if (0 == jack_get_property(mJackClientUUID, bpm_key.c_str(), &values, &types)) {
+      std::string values;
+      std::string types;
+      if (bpm && get_property(mJackClientUUID, bpm_key, values, types)) {
         //convert to double and store if success
         char* pEnd = nullptr;
-        double bpm = std::strtod(values, &pEnd);
+        double bpm = std::strtod(values.c_str(), &pEnd);
         if (*pEnd == 0)
           mBPM.store(bpm, std::memory_order_release);
-        //free
-        if (values)
-          jack_free(values);
-        if (types)
-          jack_free(types);
+      }
+      if (enable && get_property(mJackClientUUID, start_stop_key, values, types)) {
+        bool set = std::find(true_values.begin(), true_values.end(), values) != true_values.end();
+        mLink.enableStartStopSync(set);
       }
     } else if (change == jack_property_change_t::PropertyDeleted) {
-      setBPMProperty(mBPM.load(std::memory_order_acquire));
+      if (bpm)
+        setBPMProperty(mBPM.load(std::memory_order_acquire));
+      if (enable)
+        setEnableStartStopProperty(mLink.isStartStopSyncEnabled());
     }
   }
 }
@@ -203,5 +230,12 @@ void JackTransportLink::setBPMProperty(double bpm) {
   if (!jack_uuid_empty(mJackClientUUID)) {
     std::string bpms = std::to_string(bpm);
     jack_set_property(mJackClient, mJackClientUUID, bpm_key.c_str(), bpms.c_str(), decimal_type);
+  }
+}
+
+void JackTransportLink::setEnableStartStopProperty(bool enable) {
+  if (!jack_uuid_empty(mJackClientUUID)) {
+    std::string enables = enable ? "true" : "false";
+    jack_set_property(mJackClient, mJackClientUUID, start_stop_key.c_str(), enables.c_str(), bool_type);
   }
 }
