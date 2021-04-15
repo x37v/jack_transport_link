@@ -40,8 +40,9 @@ conan_cmake_install(PATH_OR_REFERENCE .
   REMOTE conan-center
   SETTINGS ${settings})
 
-find_library(JACK_LIB "jack" REQUIRED)
 find_package(cpp-optparse REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(JACK jack>=1.9.12)
 
 include(3rdparty/link/AbletonLinkConfig.cmake)
 
@@ -49,6 +50,7 @@ include_directories(
   ./src/
   ./3rdparty/link/include/
   ${cpp-optparse_INCLUDE_DIRS}
+  ${JACK_INCLUDE_DIRS}
 )
 
 if (UNIX)
@@ -63,7 +65,13 @@ add_executable(${PROJECT_APP}
   src/main.cpp
   src/JackTransportLink.cpp
 )
-target_link_libraries(${PROJECT_APP} ${cpp-optparse_LIBS} ${JACK_LIB} ${PLATFORM_LIBS} Ableton::Link)
+target_link_libraries(
+  ${PROJECT_APP}
+  ${cpp-optparse_LIBS}
+  ${JACK_LIBS}
+  ${PLATFORM_LIBS}
+  Ableton::Link
+)
 
 install(TARGETS ${PROJECT_APP} DESTINATION bin)
 
