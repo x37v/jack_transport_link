@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16 FATAL_ERROR)
 
-set (PROJECT_VERSION "0.0.5")
+set (PROJECT_VERSION "0.0.6")
 
 project(jack_transport_link
   VERSION ${PROJECT_VERSION}
@@ -9,7 +9,7 @@ project(jack_transport_link
 set(CMAKE_CXX_STANDARD 17)
 set(PROJECT_APP "jack_transport_link")
 
-set(INSTALL_SERVICE_FILE OFF CACHE BOOL "Should we install a service file")
+set(INSTALL_SERVICE_FILE ON CACHE BOOL "Should we install a service file")
 
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Choose the type of build, options are: Debug Release" FORCE)

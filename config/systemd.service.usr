@@ -9,7 +9,7 @@
   Type=idle
   ExecStart=/usr/bin/jack_transport_link
   KillSignal=SIGINT
-  User=pi
+  User=rnbo
   Group=audio
   LimitRTPRIO=infinity
   LimitMEMLOCK=infinity
