@@ -17,5 +17,6 @@ if [ "$1" = "purge" ]; then
 		deb-systemd-helper purge 'jack_transport_link.service' >/dev/null || true
 		deb-systemd-helper unmask 'jack_transport_link.service' >/dev/null || true
 	fi
+
 fi
 # End automatically added section
