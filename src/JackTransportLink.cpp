@@ -152,8 +152,8 @@ void JackTransportLink::timeBaseCallback(jack_transport_state_t transportState, 
 
   if (posIsNew) {
     double time = pos->frame / (static_cast<double>(pos->frame_rate) * 60.0);
-		tickCurrent = time * bpm * ticksPerBeat;
-		linkBeat = tickCurrent / ticksPerBeat;
+    tickCurrent = time * bpm * ticksPerBeat;
+    linkBeat = tickCurrent / ticksPerBeat;
 
     //use frame to compute the beat
     sessionState.requestBeatAtTime(linkBeat, mTimeNext, quantum);
