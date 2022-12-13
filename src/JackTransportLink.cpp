@@ -42,7 +42,6 @@ JackTransportLink::JackTransportLink(
   mInitialTimeSigDenom(initialTimeSigDenom),
   mInitialTicksPerBeat(initialTicksPerBeat),
   mLink(initialBPM),
-  mRequestPosition(false),
   mJackClientUUID(0)
 {
   //setup link
@@ -120,7 +119,7 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
   bool stateChange = transportState != mTransportStateReportedLast && (rolling || transportState == jack_transport_state_t::JackTransportStopped);
   double bpm = mBPM.load(std::memory_order_acquire);
   bool bpmChange = bbtValid && pos.beats_per_minute != bpm;
-  if (stateChange || bpmChange || mRequestPosition) {
+  if (stateChange || bpmChange) {
     auto sessionState = mLink.captureAudioSessionState();
     if (stateChange) {
       sessionState.setIsPlaying(rolling, mTime);
@@ -129,17 +128,6 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
     if (bpmChange) {
       sessionState.setTempo(bpm, mTime);
       mBPMLast = bpm;
-    }
-    //XXX in follower mode, do we always just request position?
-    if (mRequestPosition) {
-      double quantum = bbtValid ? pos.beats_per_bar : mInitialQuantum;
-      //request position
-      double linkBeat = static_cast<double>(pos.bar - 1) * quantum
-        + static_cast<double>(pos.beat - 1)
-        + static_cast<double>(pos.tick) / pos.ticks_per_beat;
-      //TODO offset time based on bbtOffset?
-      sessionState.requestBeatAtTime(linkBeat, mTime, quantum);
-      mRequestPosition = false;
     }
     mLink.commitAudioSessionState(sessionState);
   }
@@ -158,27 +146,36 @@ void JackTransportLink::timeBaseCallback(jack_transport_state_t transportState, 
 
   double bpm = mBPM.load(std::memory_order_acquire);
   double quantum = bbtValid ? pos->beats_per_bar : mInitialQuantum;
+  double ticksPerBeat = bbtValid ? pos->ticks_per_beat : mInitialTicksPerBeat;
+  double linkBeat = std::max(0.0, sessionState.beatAtTime(mTimeNext, quantum));
+  double tickCurrent = linkBeat * ticksPerBeat;
 
-  if (posIsNew && bbtValid) {
-    mRequestPosition = true;
+  if (posIsNew) {
+    double time = pos->frame / (static_cast<double>(pos->frame_rate) * 60.0);
+		tickCurrent = time * bpm * ticksPerBeat;
+		linkBeat = tickCurrent / ticksPerBeat;
+
+    //use frame to compute the beat
+    sessionState.requestBeatAtTime(linkBeat, mTimeNext, quantum);
+
+    mLink.commitAudioSessionState(sessionState);
+    linkBeat = std::max(0.0, sessionState.beatAtTime(mTimeNext, quantum));
+    tickCurrent = linkBeat * ticksPerBeat;
   }
+  auto linkPhase = sessionState.phaseAtTime(mTimeNext, quantum);
 
-  auto linkBeat = std::max(0.0, sessionState.beatAtTime(mTime, quantum));
-  auto linkPhase = sessionState.phaseAtTime(mTime, quantum);
 
   //what if quantum changes? Does link keep track of that or should we compute bar some other way?
   auto bar = std::floor(linkBeat / quantum);
   auto beat = std::max(0.0, linkPhase);
-  double ticksPerBeat = bbtValid ? pos->ticks_per_beat : mInitialTicksPerBeat;
   float beatType = bbtValid ? pos->beat_type : mInitialTimeSigDenom; 
 
-  double tickCurrent = linkBeat * ticksPerBeat;
 
   pos->valid = JackPositionBBT;
   pos->bar = static_cast<int32_t>(bar) + 1;
   pos->beat = static_cast<int32_t>(beat) + 1;
   pos->tick = static_cast<int32_t>(ticksPerBeat * (beat - floor(beat)));
-  pos->bar_start_tick = tickCurrent - beat * ticksPerBeat;
+  pos->bar_start_tick = bar * quantum * ticksPerBeat;
   pos->beats_per_bar = static_cast<float>(quantum);
   pos->beat_type = beatType;
   pos->ticks_per_beat = ticksPerBeat;
@@ -239,3 +236,4 @@ void JackTransportLink::setEnableStartStopProperty(bool enable) {
     jack_set_property(mJackClient, mJackClientUUID, start_stop_key.c_str(), enables.c_str(), bool_type);
   }
 }
+

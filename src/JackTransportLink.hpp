@@ -49,7 +49,5 @@ class JackTransportLink {
     float mInitialTimeSigDenom;
     double mInitialTicksPerBeat;
 
-    bool mRequestPosition;
-
     jack_uuid_t mJackClientUUID;
 };
