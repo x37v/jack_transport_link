@@ -75,6 +75,8 @@ JackTransportLink::JackTransportLink(
     }
   }
 
+  mClickPort = jack_port_register(mJackClient, "clickout", JACK_DEFAULT_AUDIO_TYPE, JackPortFlags::JackPortIsOutput, 0);
+
   //setup jack, become the timebase master, unconditionally
   jack_set_process_callback(mJackClient, JackTransportLink::processCallback, this);
   jack_set_timebase_callback(mJackClient, 0, JackTransportLink::timeBaseCallback, this);
@@ -132,6 +134,30 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
     mLink.commitAudioSessionState(sessionState);
   }
 
+  if (mClickPort != nullptr) {
+    jack_default_audio_sample_t * buf = reinterpret_cast<jack_default_audio_sample_t *>(jack_port_get_buffer(mClickPort, nframes));
+
+    //zero out
+    std::memset(buf, 0, nframes * sizeof(jack_default_audio_sample_t));
+    if (bbtValid && rolling) {
+
+      const double clicksPerBeat = 4;
+      const double sr = static_cast<double>(jack_get_sample_rate(mJackClient));
+
+      double framesPerTick = 60.0 * sr / (pos.ticks_per_beat * pos.beats_per_minute);
+      double ticksPerClick = pos.ticks_per_beat / clicksPerBeat;
+      double framesPerClick = framesPerTick * ticksPerClick;
+
+      double nextClickTick = ticksPerClick - std::fmod(static_cast<double>(pos.tick), ticksPerClick);
+      double nextClickFrame = nextClickTick * framesPerTick;
+
+      for (double frame = nextClickFrame; frame < static_cast<double>(nframes); frame += framesPerClick) {
+        jack_nframes_t f = static_cast<jack_nframes_t>(frame);
+        buf[f] = 1.0;
+      }
+    }
+  }
+
   return 0;
 }
 
@@ -180,7 +206,7 @@ void JackTransportLink::timeBaseCallback(jack_transport_state_t transportState, 
   pos->beat_type = beatType;
   pos->ticks_per_beat = ticksPerBeat;
   pos->beats_per_minute = bpm;
-}
+} 
 
 int JackTransportLink::syncCallback(jack_transport_state_t state, jack_position_t *pos, void *arg) {
   return reinterpret_cast<JackTransportLink *>(arg)->syncCallback(state, pos);

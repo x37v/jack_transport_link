@@ -36,6 +36,7 @@ class JackTransportLink {
     void setEnableStartStopProperty(bool enable);
 
     jack_client_t * mJackClient;
+    jack_port_t * mClickPort = nullptr;
     ableton::Link mLink;
 
     std::chrono::microseconds mTime;
