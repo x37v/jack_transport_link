@@ -95,6 +95,17 @@ int JackTransportLink::processCallback(jack_nframes_t nframes, void *arg) {
   return reinterpret_cast<JackTransportLink *>(arg)->processCallback(nframes);
 }
 
+void updateBBT(int32_t& bar, int32_t& beat, double& tick, double ticks_per_beat) {
+  if (tick >= ticks_per_beat) {
+    beat += 1;
+    tick = std::fmod(tick, ticks_per_beat);
+    if (beat >= 4) {
+      beat = 0;
+      bar += 1;
+    }
+  }
+}
+
 int JackTransportLink::processCallback(jack_nframes_t nframes) {
   //compute the time, the timeBaseCallback is called right after this processCallback
   {
@@ -144,17 +155,43 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
       const double clicksPerBeat = 4;
       const double sr = static_cast<double>(jack_get_sample_rate(mJackClient));
 
+      int32_t beat = pos.beat - 1;
+      int32_t bar = pos.bar - 1;
+      double tick = static_cast<double>(pos.tick);
+
       double framesPerTick = 60.0 * sr / (pos.ticks_per_beat * pos.beats_per_minute);
       double ticksPerClick = pos.ticks_per_beat / clicksPerBeat;
       double framesPerClick = framesPerTick * ticksPerClick;
 
-      double nextClickTick = ticksPerClick - std::fmod(static_cast<double>(pos.tick), ticksPerClick);
-      double nextClickFrame = nextClickTick * framesPerTick;
+      double offsetTicks = std::fmod(tick, ticksPerClick);
+      offsetTicks = offsetTicks <= 0.0 ? 0.0 : ticksPerClick - offsetTicks;
+      tick = tick + offsetTicks;
+      updateBBT(bar, beat, tick, pos.ticks_per_beat);
 
-      for (double frame = nextClickFrame; frame < static_cast<double>(nframes); frame += framesPerClick) {
-        jack_nframes_t f = static_cast<jack_nframes_t>(frame);
-        buf[f] = 1.0;
+      //skip dupes
+      if (mBarLast == bar && mBeatLast == beat && mTickLast == tick) {
+        //std::cout << bar << ":" << beat << ":" << tick << " last: " << mBarLast << ":" << mBeatLast << ":" << mTickLast << std::endl;
+        tick += ticksPerClick;
+        offsetTicks += ticksPerClick;
+        updateBBT(bar, beat, tick, pos.ticks_per_beat);
       }
+
+      double nextClickFrame = offsetTicks * framesPerTick;
+
+      double frame = nextClickFrame;
+      while (ceil(frame) < static_cast<double>(nframes)) {
+        jack_nframes_t f = static_cast<jack_nframes_t>(frame);
+        buf[f] = 1.0; //0.5 + 0.5 * static_cast<jack_default_audio_sample_t>(beat) / 4.0;
+
+        mTickLast = tick;
+        mBeatLast = beat;
+        mBarLast = bar;
+
+        tick += ticksPerClick;
+        frame = frame + framesPerClick;
+        updateBBT(bar, beat, tick, pos.ticks_per_beat);
+      }
+
     }
   }
 
@@ -166,16 +203,28 @@ void JackTransportLink::timeBaseCallback(jack_transport_state_t state, jack_nfra
 }
 
 //timebase callback, only called while transport is running or starting
-void JackTransportLink::timeBaseCallback(jack_transport_state_t transportState, jack_nframes_t /*nframes*/, jack_position_t *pos, bool posIsNew) {
+void JackTransportLink::timeBaseCallback(jack_transport_state_t transportState, jack_nframes_t nframes, jack_position_t *pos, bool posIsNew) {
   auto sessionState = mLink.captureAudioSessionState();
   bool bbtValid = pos->valid & JackPositionBBT;
 
   double bpm = mBPM.load(std::memory_order_acquire);
   double quantum = bbtValid ? pos->beats_per_bar : mInitialQuantum;
   double ticksPerBeat = bbtValid ? pos->ticks_per_beat : mInitialTicksPerBeat;
+
+#if 0
   double linkBeat = std::max(0.0, sessionState.beatAtTime(mTimeNext, quantum));
+#else
+  double linkBeat = mInternalBeat;
+#endif
+
+  //TODO handle negative
+  if (linkBeat < 0.0) {
+    linkBeat = 0.0;
+  }
+
   double tickCurrent = linkBeat * ticksPerBeat;
 
+#if 0
   if (posIsNew) {
     double time = pos->frame / (static_cast<double>(pos->frame_rate) * 60.0);
     tickCurrent = time * bpm * ticksPerBeat;
@@ -185,27 +234,34 @@ void JackTransportLink::timeBaseCallback(jack_transport_state_t transportState, 
     sessionState.requestBeatAtTime(linkBeat, mTimeNext, quantum);
 
     mLink.commitAudioSessionState(sessionState);
-    linkBeat = std::max(0.0, sessionState.beatAtTime(mTimeNext, quantum));
+    linkBeat = sessionState.beatAtTime(mTimeNext, quantum);
+    if (linkBeat < 0.0) {
+      linkBeat = 0.0;
+      std::cout << "beat is negative: " << linkBeat << std::endl;
+    }
     tickCurrent = linkBeat * ticksPerBeat;
   }
-  auto linkPhase = sessionState.phaseAtTime(mTimeNext, quantum);
-
+#endif
 
   //what if quantum changes? Does link keep track of that or should we compute bar some other way?
   auto bar = std::floor(linkBeat / quantum);
-  auto beat = std::max(0.0, linkPhase);
+  auto beat = std::fmod(linkBeat, quantum);
+  auto tick = trunc(ticksPerBeat * (beat - trunc(beat)));
   float beatType = bbtValid ? pos->beat_type : mInitialTimeSigDenom; 
-
 
   pos->valid = JackPositionBBT;
   pos->bar = static_cast<int32_t>(bar) + 1;
   pos->beat = static_cast<int32_t>(beat) + 1;
-  pos->tick = static_cast<int32_t>(ticksPerBeat * (beat - floor(beat)));
+  pos->tick = static_cast<int32_t>(tick);
   pos->bar_start_tick = bar * quantum * ticksPerBeat;
   pos->beats_per_bar = static_cast<float>(quantum);
   pos->beat_type = beatType;
   pos->ticks_per_beat = ticksPerBeat;
   pos->beats_per_minute = bpm;
+
+  if (transportState == jack_transport_state_t::JackTransportRolling) {
+    mInternalBeat += bpm * static_cast<double>(nframes) / (static_cast<double>(jack_get_sample_rate(mJackClient)) * 60.0);
+  }
 } 
 
 int JackTransportLink::syncCallback(jack_transport_state_t state, jack_position_t *pos, void *arg) {
