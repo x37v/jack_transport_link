@@ -3,6 +3,11 @@
 #include <jack/uuid.h>
 #include <string>
 
+//debugging defines
+
+//#define DO_CLICK_OUT
+//#define USE_INTERNAL_BEAT
+
 namespace {
   const char * decimal_type = "https://www.w3.org/2001/XMLSchema#decimal";
   const char * bool_type = "https://www.w3.org/2001/XMLSchema#boolean";
@@ -75,7 +80,9 @@ JackTransportLink::JackTransportLink(
     }
   }
 
+#ifdef DO_CLICK_OUT
   mClickPort = jack_port_register(mJackClient, "clickout", JACK_DEFAULT_AUDIO_TYPE, JackPortFlags::JackPortIsOutput, 0);
+#endif
 
   //setup jack, become the timebase master, unconditionally
   jack_set_process_callback(mJackClient, JackTransportLink::processCallback, this);
@@ -145,6 +152,7 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
     mLink.commitAudioSessionState(sessionState);
   }
 
+#ifdef DO_CLICK_OUT
   if (mClickPort != nullptr) {
     jack_default_audio_sample_t * buf = reinterpret_cast<jack_default_audio_sample_t *>(jack_port_get_buffer(mClickPort, nframes));
 
@@ -194,6 +202,7 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
 
     }
   }
+#endif
 
   return 0;
 }
@@ -201,6 +210,7 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
 void JackTransportLink::timeBaseCallback(jack_transport_state_t state, jack_nframes_t nframes, jack_position_t *pos, int new_pos, void *arg) {
   reinterpret_cast<JackTransportLink *>(arg)->timeBaseCallback(state, nframes, pos, new_pos);
 }
+
 
 //timebase callback, only called while transport is running or starting
 void JackTransportLink::timeBaseCallback(jack_transport_state_t transportState, jack_nframes_t nframes, jack_position_t *pos, bool posIsNew) {
@@ -211,7 +221,7 @@ void JackTransportLink::timeBaseCallback(jack_transport_state_t transportState, 
   double quantum = bbtValid ? pos->beats_per_bar : mInitialQuantum;
   double ticksPerBeat = bbtValid ? pos->ticks_per_beat : mInitialTicksPerBeat;
 
-#if 0
+#ifndef USE_INTERNAL_BEAT
   double linkBeat = std::max(0.0, sessionState.beatAtTime(mTimeNext, quantum));
 #else
   double linkBeat = mInternalBeat;
@@ -224,7 +234,7 @@ void JackTransportLink::timeBaseCallback(jack_transport_state_t transportState, 
 
   double tickCurrent = linkBeat * ticksPerBeat;
 
-#if 0
+#ifndef USE_INTERNAL_BEAT
   if (posIsNew) {
     double time = pos->frame / (static_cast<double>(pos->frame_rate) * 60.0);
     tickCurrent = time * bpm * ticksPerBeat;
@@ -259,9 +269,11 @@ void JackTransportLink::timeBaseCallback(jack_transport_state_t transportState, 
   pos->ticks_per_beat = ticksPerBeat;
   pos->beats_per_minute = bpm;
 
+#ifdef USE_INTERNAL_BEAT
   if (transportState == jack_transport_state_t::JackTransportRolling) {
     mInternalBeat += bpm * static_cast<double>(nframes) / (static_cast<double>(jack_get_sample_rate(mJackClient)) * 60.0);
   }
+#endif
 } 
 
 int JackTransportLink::syncCallback(jack_transport_state_t state, jack_position_t *pos, void *arg) {
