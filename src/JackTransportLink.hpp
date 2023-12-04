@@ -38,6 +38,13 @@ class JackTransportLink {
     jack_client_t * mJackClient;
     ableton::Link mLink;
 
+    jack_port_t * mClickPort = nullptr;
+    double mInternalBeat = 0.0;
+
+    int32_t mBeatLast = -1;
+    int32_t mBarLast = -1;
+    double mTickLast = -1.0;
+
     std::chrono::microseconds mTime;
     std::chrono::microseconds mTimeNext;
 
@@ -48,8 +55,6 @@ class JackTransportLink {
     double mInitialQuantum; //time sig num, called quantum in link
     float mInitialTimeSigDenom;
     double mInitialTicksPerBeat;
-
-    bool mRequestPosition;
 
     jack_uuid_t mJackClientUUID;
 };
