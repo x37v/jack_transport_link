@@ -221,8 +221,10 @@ void JackTransportLink::timeBaseCallback(jack_transport_state_t transportState, 
   double quantum = bbtValid ? pos->beats_per_bar : mInitialQuantum;
   double ticksPerBeat = bbtValid ? pos->ticks_per_beat : mInitialTicksPerBeat;
 
+  auto linkTime = mTime;
+
 #ifndef USE_INTERNAL_BEAT
-  double linkBeat = std::max(0.0, sessionState.beatAtTime(mTimeNext, quantum));
+  double linkBeat = std::max(0.0, sessionState.beatAtTime(linkTime, quantum));
 #else
   double linkBeat = mInternalBeat;
 #endif
@@ -241,10 +243,10 @@ void JackTransportLink::timeBaseCallback(jack_transport_state_t transportState, 
     linkBeat = tickCurrent / ticksPerBeat;
 
     //use frame to compute the beat
-    sessionState.requestBeatAtTime(linkBeat, mTimeNext, quantum);
+    sessionState.requestBeatAtTime(linkBeat, linkTime, quantum);
 
     mLink.commitAudioSessionState(sessionState);
-    linkBeat = sessionState.beatAtTime(mTimeNext, quantum);
+    linkBeat = sessionState.beatAtTime(linkTime, quantum);
     if (linkBeat < 0.0) {
       linkBeat = 0.0;
       std::cout << "beat is negative: " << linkBeat << std::endl;
