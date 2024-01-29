@@ -32,9 +32,9 @@ If everything succeeds, you should have an executable here: `./bin/jack_transpor
 
 ### Linux Systemd Service
 
-There is an optional systemd service file that you can enable, but at this time
-it is run as the user `pi` for the raspi. You can enable that through the cmake
-`-DINSTALL_SERVICE_FILE=On`
+There is an optional systemd service file that is enabled by default, at this
+time it is run as the user `pi` for the raspi. You can disable that through the
+cmake `-DINSTALL_SERVICE_FILE=Off`
 
 If you want to target a different user, you'll have to edit the appropriate file in `config/`
 
