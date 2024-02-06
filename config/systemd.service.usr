@@ -19,4 +19,3 @@
 
 [Install]
   WantedBy=multi-user.target
-  Alias=jack_transport_link
