@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16 FATAL_ERROR)
 
-set (PROJECT_VERSION "0.0.7")
+set (PROJECT_VERSION "0.0.8")
 
 project(jack_transport_link
   VERSION ${PROJECT_VERSION}
