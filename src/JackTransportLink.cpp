@@ -159,65 +159,88 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
     mLink.commitAudioSessionState(sessionState);
   }
 
-
 #ifndef DO_CLICK_OUT
   //write midi sync
-  {
-    auto midi_buf = jack_port_get_buffer(mMIDIClockOut, nframes);
-    jack_midi_clear_buffer(midi_buf);
+  auto midi_buf = jack_port_get_buffer(mMIDIClockOut, nframes);
+  jack_midi_clear_buffer(midi_buf);
 
-    const double clocksPerBeat = 24;
-    const double sr = static_cast<double>(jack_get_sample_rate(mJackClient));
+  if (bbtValid) {
+    if (rolling) {
+      const double clocksPerBeat = 24;
+      const double sr = static_cast<double>(jack_get_sample_rate(mJackClient));
 
-    int32_t beat = pos.beat - 1;
-    int32_t bar = pos.bar - 1;
-    double tick = static_cast<double>(pos.tick);
+      int32_t beat = pos.beat - 1;
+      int32_t bar = pos.bar - 1;
+      double tick = static_cast<double>(pos.tick);
 
-    double framesPerTick = 60.0 * sr / (pos.ticks_per_beat * pos.beats_per_minute);
-    double ticksPerClock = pos.ticks_per_beat / clocksPerBeat;
-    double framesPerClock = framesPerTick * ticksPerClock;
+      double framesPerTick = 60.0 * sr / (pos.ticks_per_beat * pos.beats_per_minute);
+      double ticksPerClock = pos.ticks_per_beat / clocksPerBeat;
+      double framesPerClock = framesPerTick * ticksPerClock;
 
-    double offsetTicks = std::fmod(tick, ticksPerClock);
-    offsetTicks = offsetTicks <= 0.0 ? 0.0 : ticksPerClock - offsetTicks;
-    tick = tick + offsetTicks;
-    updateBBT(bar, beat, tick, pos.ticks_per_beat);
-
-    //skip dupes
-    if (mBarLast == bar && mBeatLast == beat && mTickLast == tick) {
-      tick += ticksPerClock;
-      offsetTicks += ticksPerClock;
+      double offsetTicks = std::fmod(tick, ticksPerClock);
+      offsetTicks = offsetTicks <= 0.0 ? 0.0 : ticksPerClock - offsetTicks;
+      tick = tick + offsetTicks;
       updateBBT(bar, beat, tick, pos.ticks_per_beat);
-    }
 
-    double nextClockFrame = offsetTicks * framesPerTick;
+      //skip dupes
+      if (mBarLast == bar && mBeatLast == beat && mTickLast == tick) {
+        tick += ticksPerClock;
+        offsetTicks += ticksPerClock;
+        updateBBT(bar, beat, tick, pos.ticks_per_beat);
+      }
+      double nextClockFrame = offsetTicks * framesPerTick;
 
-    //TODO continue
-    if (transportState == JackTransportStopped && mMIDIClockRunState != MIDIClockRunState::Stopped) {
+      double frame = nextClockFrame;
+      while (ceil(frame) < static_cast<double>(nframes)) {
+        jack_nframes_t f = static_cast<jack_nframes_t>(frame);
+        bool started = false;
+
+        //see if we need to send a start
+        if (mMIDIClockRunState != MIDIClockRunState::Running && beat == 0 && tick < ticksPerClock && tick >= 0 && bar >= 0) {
+          mMIDIClockRunState = MIDIClockRunState::Running;
+          mMIDIClockCount = 0;
+          started = true;
+          jack_midi_event_write(midi_buf, f, midi_start_buf.data(), midi_start_buf.size());
+        } 
+
+        if (mMIDIClockRunState == MIDIClockRunState::Running) {
+          if (!started) {
+            //verify that we're keeping in sync with 24 clocks per quarter note
+            bool resync = false;
+            mMIDIClockCount++;
+            if (mMIDIClockCount >= 24) {
+              if (tick > ticksPerClock) {
+                resync = true;
+                //std::cout << "clock over sync? bar: " << bar << " beat: " << beat << " tick: " << tick << std::endl;
+              }
+              mMIDIClockCount = 0;
+            } else if (tick < ticksPerClock) {
+              resync = true;
+              //std::cout << "clock under sync? bar: " << bar << " beat: " << beat << " tick: " << tick << std::endl;
+            }
+
+            if (resync) {
+              mMIDIClockRunState = MIDIClockRunState::NeedsSync;
+              jack_midi_event_write(midi_buf, f, midi_stop_buf.data(), midi_stop_buf.size());
+              break;
+            }
+          }
+          jack_midi_event_write(midi_buf, f, midi_clock_buf.data(), midi_clock_buf.size());
+        }
+
+        mTickLast = tick;
+        mBeatLast = beat;
+        mBarLast = bar;
+
+        tick += ticksPerClock;
+        frame = frame + framesPerClock;
+        updateBBT(bar, beat, tick, pos.ticks_per_beat);
+      }
+    } else if (transportState == JackTransportStopped && mMIDIClockRunState != MIDIClockRunState::Stopped) {
       mMIDIClockRunState = MIDIClockRunState::Stopped;
       jack_midi_event_write(midi_buf, 0, midi_stop_buf.data(), midi_stop_buf.size());
+      invalidateClockSyncBBT();
     }
-
-    double frame = nextClockFrame;
-    while (ceil(frame) < static_cast<double>(nframes)) {
-      jack_nframes_t f = static_cast<jack_nframes_t>(frame);
-
-      //see if we need to send a start
-      if (rolling && mMIDIClockRunState != MIDIClockRunState::Running && beat == 0 && bar == mBarLast + 1) {
-        mMIDIClockRunState = MIDIClockRunState::Running;
-        jack_midi_event_write(midi_buf, f, midi_start_buf.data(), midi_start_buf.size());
-      }
-
-      jack_midi_event_write(midi_buf, f, midi_clock_buf.data(), midi_clock_buf.size());
-
-      mTickLast = tick;
-      mBeatLast = beat;
-      mBarLast = bar;
-
-      tick += ticksPerClock;
-      frame = frame + framesPerClock;
-      updateBBT(bar, beat, tick, pos.ticks_per_beat);
-    }
-
   }
 #else 
   if (mClickPort != nullptr) {
@@ -316,9 +339,13 @@ void JackTransportLink::timeBaseCallback(jack_transport_state_t transportState, 
     linkBeat = sessionState.beatAtTime(linkTime, quantum);
     if (linkBeat < 0.0) {
       linkBeat = 0.0;
-      std::cout << "beat is negative: " << linkBeat << std::endl;
+      //std::cout << "beat is negative: " << linkBeat << std::endl;
     }
     tickCurrent = linkBeat * ticksPerBeat;
+
+    //need to sync again since we repositioned
+    mMIDIClockRunState = MIDIClockRunState::NeedsSync;
+    invalidateClockSyncBBT();
   }
 #endif
 
@@ -398,5 +425,11 @@ void JackTransportLink::setEnableStartStopProperty(bool enable) {
     std::string enables = enable ? "true" : "false";
     jack_set_property(mJackClient, mJackClientUUID, start_stop_key.c_str(), enables.c_str(), bool_type);
   }
+}
+
+void JackTransportLink::invalidateClockSyncBBT() {
+  mBeatLast = -1;
+  mBarLast = -1;
+  mTickLast = -1.0;
 }
 
