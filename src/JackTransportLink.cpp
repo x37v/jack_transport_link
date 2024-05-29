@@ -220,6 +220,7 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
             }
 
             if (resync) {
+              //TODO could we be smarter and simply issue some extra or skip some clocks?
               mMIDIClockRunState = MIDIClockRunState::NeedsSync;
               jack_midi_event_write(midi_buf, f, midi_stop_buf.data(), midi_stop_buf.size());
               break;
