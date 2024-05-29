@@ -193,38 +193,41 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
       double frame = nextClockFrame;
       while (ceil(frame) < static_cast<double>(nframes)) {
         jack_nframes_t f = static_cast<jack_nframes_t>(frame);
-        bool started = false;
 
         //see if we need to send a start
-        if (mMIDIClockRunState != MIDIClockRunState::Running && beat == 0 && tick < ticksPerClock && tick >= 0 && bar >= 0) {
-          mMIDIClockRunState = MIDIClockRunState::Running;
-          mMIDIClockCount = 0;
-          started = true;
-          jack_midi_event_write(midi_buf, f, midi_start_buf.data(), midi_start_buf.size());
-        } 
+        if (mMIDIClockRunState != MIDIClockRunState::Running) {
+          if (beat == 0 && tick < ticksPerClock && tick >= 0 && bar >= 0) {
+            mMIDIClockRunState = MIDIClockRunState::Running;
+            mMIDIClockCount = 24; //let roll over
+            jack_midi_event_write(midi_buf, f, midi_start_buf.data(), midi_start_buf.size());
 
-        if (mMIDIClockRunState == MIDIClockRunState::Running) {
-          if (!started) {
-            //verify that we're keeping in sync with 24 clocks per quarter note
-            bool resync = false;
-            mMIDIClockCount++;
-            if (mMIDIClockCount >= 24) {
-              if (tick > ticksPerClock) {
-                resync = true;
-                //std::cout << "clock over sync? bar: " << bar << " beat: " << beat << " tick: " << tick << std::endl;
-              }
-              mMIDIClockCount = 0;
-            } else if (tick < ticksPerClock) {
+            //delay clock 1ms or half a clock period
+            //http://midi.teragonaudio.com/tech/midispec.htm
+            //restart the loop so we make sure we're in bounds
+            double delay = std::min(framesPerClock / 2, sr / 1000.0);
+            frame += delay;
+            continue;
+          }
+        } else {
+          //verify that we're keeping in sync with 24 clocks per quarter note
+          bool resync = false;
+          mMIDIClockCount++;
+          if (mMIDIClockCount >= 24) {
+            if (tick > ticksPerClock) {
               resync = true;
-              //std::cout << "clock under sync? bar: " << bar << " beat: " << beat << " tick: " << tick << std::endl;
+              //std::cout << "clock over sync? bar: " << bar << " beat: " << beat << " tick: " << tick << std::endl;
             }
+            mMIDIClockCount = 0;
+          } else if (tick < ticksPerClock) {
+            resync = true;
+            //std::cout << "clock under sync? bar: " << bar << " beat: " << beat << " tick: " << tick << std::endl;
+          }
 
-            if (resync) {
-              //TODO could we be smarter and simply issue some extra or skip some clocks?
-              mMIDIClockRunState = MIDIClockRunState::NeedsSync;
-              jack_midi_event_write(midi_buf, f, midi_stop_buf.data(), midi_stop_buf.size());
-              break;
-            }
+          if (resync) {
+            //TODO could we be smarter and simply issue some extra or skip some clocks?
+            mMIDIClockRunState = MIDIClockRunState::NeedsSync;
+            jack_midi_event_write(midi_buf, f, midi_stop_buf.data(), midi_stop_buf.size());
+            break;
           }
           jack_midi_event_write(midi_buf, f, midi_clock_buf.data(), midi_clock_buf.size());
         }
