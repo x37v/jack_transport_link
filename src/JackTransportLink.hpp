@@ -13,6 +13,11 @@
 
 class JackTransportLink {
   public:
+    enum class MIDIClockRunState {
+      Running,
+      Stopped
+    };
+
     JackTransportLink(
         jack_client_t * client,
         bool enableStartStopSync = true,
@@ -37,6 +42,9 @@ class JackTransportLink {
 
     jack_client_t * mJackClient;
     ableton::Link mLink;
+
+    jack_port_t * mMIDIClockOut = nullptr;
+    MIDIClockRunState mMIDIClockRunState = MIDIClockRunState::Stopped;
 
     jack_port_t * mClickPort = nullptr;
     double mInternalBeat = 0.0;

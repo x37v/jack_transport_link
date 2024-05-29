@@ -1,5 +1,6 @@
 #include "JackTransportLink.hpp"
 
+#include <jack/midiport.h>
 #include <jack/uuid.h>
 #include <string>
 
@@ -14,6 +15,10 @@ namespace {
   const std::string bpm_key("http://www.x37v.info/jack/metadata/bpm");
   const std::string start_stop_key("http://www.x37v.info/jack/metadata/link/start-stop-sync");
   const std::array<std::string, 2> true_values = { "true", "1" };
+
+  const std::array<uint8_t, 1> midi_clock_buf = { 248 };
+  const std::array<uint8_t, 1> midi_start_buf = { 250 };
+  const std::array<uint8_t, 1> midi_stop_buf = { 252 };
 
   //helper to deal with dealloc and std::string
   bool get_property(jack_uuid_t subject, const std::string& key, std::string& value_out, std::string& type_out) {
@@ -79,6 +84,8 @@ JackTransportLink::JackTransportLink(
       jack_set_property_change_callback(mJackClient, JackTransportLink::propertyChangeCallback, this);
     }
   }
+
+  mMIDIClockOut = jack_port_register(mJackClient, "clock", JACK_DEFAULT_MIDI_TYPE, JackPortFlags::JackPortIsOutput, 0);
 
 #ifdef DO_CLICK_OUT
   mClickPort = jack_port_register(mJackClient, "clickout", JACK_DEFAULT_AUDIO_TYPE, JackPortFlags::JackPortIsOutput, 0);
@@ -152,7 +159,67 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
     mLink.commitAudioSessionState(sessionState);
   }
 
-#ifdef DO_CLICK_OUT
+
+#ifndef DO_CLICK_OUT
+  //write midi sync
+  {
+    auto midi_buf = jack_port_get_buffer(mMIDIClockOut, nframes);
+    jack_midi_clear_buffer(midi_buf);
+
+    const double clocksPerBeat = 24;
+    const double sr = static_cast<double>(jack_get_sample_rate(mJackClient));
+
+    int32_t beat = pos.beat - 1;
+    int32_t bar = pos.bar - 1;
+    double tick = static_cast<double>(pos.tick);
+
+    double framesPerTick = 60.0 * sr / (pos.ticks_per_beat * pos.beats_per_minute);
+    double ticksPerClock = pos.ticks_per_beat / clocksPerBeat;
+    double framesPerClock = framesPerTick * ticksPerClock;
+
+    double offsetTicks = std::fmod(tick, ticksPerClock);
+    offsetTicks = offsetTicks <= 0.0 ? 0.0 : ticksPerClock - offsetTicks;
+    tick = tick + offsetTicks;
+    updateBBT(bar, beat, tick, pos.ticks_per_beat);
+
+    //skip dupes
+    if (mBarLast == bar && mBeatLast == beat && mTickLast == tick) {
+      tick += ticksPerClock;
+      offsetTicks += ticksPerClock;
+      updateBBT(bar, beat, tick, pos.ticks_per_beat);
+    }
+
+    double nextClockFrame = offsetTicks * framesPerTick;
+
+    //TODO continue
+    if (transportState == JackTransportStopped && mMIDIClockRunState != MIDIClockRunState::Stopped) {
+      mMIDIClockRunState = MIDIClockRunState::Stopped;
+      jack_midi_event_write(midi_buf, 0, midi_stop_buf.data(), midi_stop_buf.size());
+    }
+
+    double frame = nextClockFrame;
+    while (ceil(frame) < static_cast<double>(nframes)) {
+      jack_nframes_t f = static_cast<jack_nframes_t>(frame);
+
+      //see if we need to send a start
+      if (rolling && mMIDIClockRunState != MIDIClockRunState::Running && beat == 0 && bar == mBarLast + 1) {
+        mMIDIClockRunState = MIDIClockRunState::Running;
+        jack_midi_event_write(midi_buf, f, midi_start_buf.data(), midi_start_buf.size());
+      }
+
+      jack_midi_event_write(midi_buf, f, midi_clock_buf.data(), midi_clock_buf.size());
+
+      mTickLast = tick;
+      mBeatLast = beat;
+      mBarLast = bar;
+
+      tick += ticksPerClock;
+      frame = frame + framesPerClock;
+      updateBBT(bar, beat, tick, pos.ticks_per_beat);
+    }
+
+  }
+#else 
   if (mClickPort != nullptr) {
     jack_default_audio_sample_t * buf = reinterpret_cast<jack_default_audio_sample_t *>(jack_port_get_buffer(mClickPort, nframes));
 
