@@ -9,6 +9,9 @@
 //#define DO_CLICK_OUT
 //#define USE_INTERNAL_BEAT
 
+
+#define MIDI_PPQ 24
+
 namespace {
   const char * decimal_type = "https://www.w3.org/2001/XMLSchema#decimal";
   const char * bool_type = "https://www.w3.org/2001/XMLSchema#boolean";
@@ -114,7 +117,7 @@ void updateBBT(int32_t& bar, int32_t& beat, double& tick, double ticks_per_beat)
     beat += 1;
     tick = std::fmod(tick, ticks_per_beat);
     if (beat >= 4) {
-      beat = 0;
+      beat = beat % 4;
       bar += 1;
     }
   }
@@ -166,7 +169,7 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
 
   if (bbtValid) {
     if (rolling) {
-      const double clocksPerBeat = 24;
+      const double clocksPerBeat = MIDI_PPQ;
       const double sr = static_cast<double>(jack_get_sample_rate(mJackClient));
 
       int32_t beat = pos.beat - 1;
@@ -177,59 +180,64 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
       double ticksPerClock = pos.ticks_per_beat / clocksPerBeat;
       double framesPerClock = framesPerTick * ticksPerClock;
 
+      //offset from buffer tick start to the tick where we should issue the first clock
       double offsetTicks = std::fmod(tick, ticksPerClock);
-      offsetTicks = offsetTicks <= 0.0 ? 0.0 : ticksPerClock - offsetTicks;
+      offsetTicks = offsetTicks <= 0.0 ? 0.0 : (ticksPerClock - offsetTicks);
+
+      //update the tick
       tick = tick + offsetTicks;
       updateBBT(bar, beat, tick, pos.ticks_per_beat);
+      double nextClockFrame = offsetTicks * framesPerTick;
 
       //skip dupes
       if (mBarLast == bar && mBeatLast == beat && mTickLast == tick) {
+        // std::cout << "dupe found: " << bar << ":" << beat << ":" << tick << std::endl;
         tick += ticksPerClock;
-        offsetTicks += ticksPerClock;
+        nextClockFrame += ticksPerClock * framesPerTick;
         updateBBT(bar, beat, tick, pos.ticks_per_beat);
       }
-      double nextClockFrame = offsetTicks * framesPerTick;
+
+      if (mMIDIClockRunState == MIDIClockRunState::NeedsSync) {
+        jack_midi_event_write(midi_buf, 0, midi_stop_buf.data(), midi_stop_buf.size());
+        mMIDIClockRunState = MIDIClockRunState::Stopped;
+      }
 
       double frame = nextClockFrame;
-      while (ceil(frame) < static_cast<double>(nframes)) {
-        jack_nframes_t f = static_cast<jack_nframes_t>(frame);
+      while (floor(frame + mClockFrameDelay) < static_cast<double>(nframes)) {
+        if (mMIDIClockRunState == MIDIClockRunState::Running) {
+          jack_nframes_t f = static_cast<jack_nframes_t>(frame + mClockFrameDelay);
+          mClockFrameDelay = 0;
 
-        //see if we need to send a start
-        if (mMIDIClockRunState != MIDIClockRunState::Running) {
-          if (beat == 0 && tick < ticksPerClock && tick >= 0 && bar >= 0) {
-            mMIDIClockRunState = MIDIClockRunState::Running;
-            mMIDIClockCount = 24; //let roll over
-            jack_midi_event_write(midi_buf, f, midi_start_buf.data(), midi_start_buf.size());
-
-            //delay clock 1ms or half a clock period
-            //http://midi.teragonaudio.com/tech/midispec.htm
-            //restart the loop so we make sure we're in bounds
-            double delay = std::min(framesPerClock / 2, sr / 1000.0);
-            frame += delay;
-            continue;
-          }
-        } else {
           //verify that we're keeping in sync with 24 clocks per quarter note
           bool resync = false;
-          mMIDIClockCount++;
-          if (mMIDIClockCount >= 24) {
-            if (tick > ticksPerClock) {
-              resync = true;
-              //std::cout << "clock over sync? bar: " << bar << " beat: " << beat << " tick: " << tick << std::endl;
-            }
-            mMIDIClockCount = 0;
+          if (mMIDIClockCount == 0) {
+            resync = tick >= ticksPerClock;
           } else if (tick < ticksPerClock) {
             resync = true;
-            //std::cout << "clock under sync? bar: " << bar << " beat: " << beat << " tick: " << tick << std::endl;
           }
 
           if (resync) {
+            //std::cout << "clock out of sync? bar: " << bar << " beat: " << beat << " tick: " << tick << " clock count: " << mMIDIClockCount << std::endl;
+            //std::cout << "\tframes per clock: " << framesPerClock << " ticks per clock:" <<  ticksPerClock << " frames per tick: " << framesPerTick << std::endl;
             //TODO could we be smarter and simply issue some extra or skip some clocks?
             mMIDIClockRunState = MIDIClockRunState::NeedsSync;
             jack_midi_event_write(midi_buf, f, midi_stop_buf.data(), midi_stop_buf.size());
             break;
           }
           jack_midi_event_write(midi_buf, f, midi_clock_buf.data(), midi_clock_buf.size());
+          mMIDIClockCount = (mMIDIClockCount + 1) % MIDI_PPQ;
+        } else if (beat == 0 && tick < ticksPerClock && tick >= 0 && bar > 0) { //XXX what about bar == 0 ?
+          //see if we need to send a start
+          mMIDIClockRunState = MIDIClockRunState::Running;
+          jack_midi_event_write(midi_buf, static_cast<jack_nframes_t>(frame), midi_start_buf.data(), midi_start_buf.size());
+
+          //std::cout << "start " << frame << " tick: " << tick << std::endl;
+
+          //delay clock 1ms or half a clock period
+          //http://midi.teragonaudio.com/tech/midispec.htm
+          //TODO mClockFrameDelay = std::min(framesPerClock / 2, sr / 1000.0);
+          mMIDIClockCount = 0;
+          continue; //restart loop
         }
 
         mTickLast = tick;
@@ -241,6 +249,7 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
         updateBBT(bar, beat, tick, pos.ticks_per_beat);
       }
     } else if (transportState == JackTransportStopped && mMIDIClockRunState != MIDIClockRunState::Stopped) {
+      mClockFrameDelay = 0;
       mMIDIClockRunState = MIDIClockRunState::Stopped;
       jack_midi_event_write(midi_buf, 0, midi_stop_buf.data(), midi_stop_buf.size());
       invalidateClockSyncBBT();

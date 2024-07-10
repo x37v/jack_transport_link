@@ -49,6 +49,7 @@ class JackTransportLink {
     jack_port_t * mMIDIClockOut = nullptr;
     MIDIClockRunState mMIDIClockRunState = MIDIClockRunState::Stopped;
     int mMIDIClockCount = 0;
+    double mClockFrameDelay = 0; //first clock tick gets a delay, track it across process calls
 
     jack_port_t * mClickPort = nullptr;
     double mInternalBeat = 0.0;
