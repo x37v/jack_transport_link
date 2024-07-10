@@ -9,6 +9,8 @@
 //#define DO_CLICK_OUT
 //#define USE_INTERNAL_BEAT
 
+//send midi start at the start of every bar
+//#define MIDI_SEND_REPEATED_STARTS
 
 #define MIDI_PPQ 24
 
@@ -224,12 +226,21 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
             jack_midi_event_write(midi_buf, f, midi_stop_buf.data(), midi_stop_buf.size());
             break;
           }
+
+#ifdef MIDI_SEND_REPEATED_STARTS
+          if (beat == 0 && mMIDIClockCount == 0) {
+            jack_midi_event_write(midi_buf, frame, midi_start_buf.data(), midi_start_buf.size());
+          }
+#endif
+
           jack_midi_event_write(midi_buf, f, midi_clock_buf.data(), midi_clock_buf.size());
           mMIDIClockCount = (mMIDIClockCount + 1) % MIDI_PPQ;
         } else if (beat == 0 && tick < ticksPerClock && tick >= 0 && bar > 0) { //XXX what about bar == 0 ?
           //see if we need to send a start
           mMIDIClockRunState = MIDIClockRunState::Running;
+#ifndef MIDI_SEND_REPEATED_STARTS
           jack_midi_event_write(midi_buf, static_cast<jack_nframes_t>(frame), midi_start_buf.data(), midi_start_buf.size());
+#endif
 
           //std::cout << "start " << frame << " tick: " << tick << std::endl;
 
