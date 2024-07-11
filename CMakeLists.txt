@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16 FATAL_ERROR)
 
-set(PROJECT_VERSION "0.0.8")
+set(PROJECT_VERSION "0.0.9")
 set(CPACK_DEBIAN_PACKAGE_RELEASE 1) #set to 1 if we inc PROJECT_VERSION, incr if we need to package new with same PROJECT_VERSION
 
 project(jack_transport_link
