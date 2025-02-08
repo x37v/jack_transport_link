@@ -12,7 +12,6 @@ set(PROJECT_APP "jack_transport_link")
 
 set(INSTALL_SERVICE_FILE ON CACHE BOOL "Should we install a service file")
 
-set(CONAN_PROFILE "default" CACHE STRING "The profile to use for building conan deps, this is useful for cross compiling")
 set(JACK_DIR "" CACHE FILEPATH "optional path to specify location for JACK libs/includes")
 mark_as_advanced(JACK_DIR)
 
@@ -24,25 +23,6 @@ if (UNIX AND NOT APPLE)
   set(LINUX TRUE)
 endif()
 
-include("${CMAKE_CURRENT_LIST_DIR}/cmake/conan.cmake")
-
-#to get find_package to work with conan generated packages
-list(APPEND CMAKE_MODULE_PATH ${CMAKE_BINARY_DIR})
-list(APPEND CMAKE_PREFIX_PATH ${CMAKE_BINARY_DIR})
-
-conan_cmake_configure(
-	REQUIRES cpp-optparse/cci.20171104
-	GENERATORS cmake_find_package)
-conan_cmake_install(
-	PATH_OR_REFERENCE .
-	BUILD missing
-	SETTINGS_HOST build_type=${CMAKE_BUILD_TYPE}
-	SETTINGS_BUILD build_type=${CMAKE_BUILD_TYPE}
-	PROFILE_HOST ${CONAN_PROFILE}
-	PROFILE_BUILD default
-)
-
-find_package(cpp-optparse REQUIRED)
 find_package(PkgConfig REQUIRED)
 
 if (JACK_DIR)
@@ -66,7 +46,7 @@ include(3rdparty/link/AbletonLinkConfig.cmake)
 include_directories(
   ./src/
   ./3rdparty/link/include/
-  ${cpp-optparse_INCLUDE_DIRS}
+  ./3rdparty/cpp-optparse/
 	${JACK_INCLUDE_DIR}
 )
 
@@ -81,11 +61,11 @@ endif()
 add_executable(${PROJECT_APP}
   src/main.cpp
   src/JackTransportLink.cpp
+  3rdparty/cpp-optparse/OptionParser.cpp
 )
 target_link_libraries(
   ${PROJECT_APP}
   PRIVATE
-  ${cpp-optparse_LIBS}
   ${PLATFORM_LIBS}
   Ableton::Link
 	${JACK_LIB}

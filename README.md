@@ -10,9 +10,6 @@ that use *Jack Transport* to synchronize their timing with other applications th
 * a compiler that can build c++17
 	* clang++, g++
 * [cmake](https://cmake.org/) 3.16 or higher
-* [conan](https://conan.io/)
-	* `pip3 install conan`
-	* make sure the *conan* executable is in your path
 
 ## Building
 

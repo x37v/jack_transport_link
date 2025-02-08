@@ -1,3 +1,6 @@
 [submodule "3rdparty/link"]
 	path = 3rdparty/link
 	url = https://github.com/Ableton/link.git
+[submodule "3rdparty/cpp-optparse"]
+	path = 3rdparty/cpp-optparse
+	url = https://github.com/weisslj/cpp-optparse
