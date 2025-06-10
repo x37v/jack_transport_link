@@ -352,9 +352,19 @@ void JackTransportLink::timeBaseCallback(jack_transport_state_t transportState, 
 
 #ifndef USE_INTERNAL_BEAT
   if (posIsNew) {
-    double time = pos->frame / (static_cast<double>(pos->frame_rate) * 60.0);
-    tickCurrent = time * bpm * ticksPerBeat;
-    linkBeat = tickCurrent / ticksPerBeat;
+
+    /*
+     *  copied from transport.c -- JACK transport master example client.
+     *
+     *  Copyright (C) 2003 Jack O'Quin.
+     */
+
+    //beat/tick etc after a seek are simply based onf frame and the current bpm
+    double min = pos->frame / ((double) pos->frame_rate * 60.0);
+    double abs_tick = min * pos->beats_per_minute * pos->ticks_per_beat;
+    double abs_beat = abs_tick / pos->ticks_per_beat;
+
+    linkBeat = abs_beat;
 
     //use frame to compute the beat
     sessionState.requestBeatAtTime(linkBeat, linkTime, quantum);
