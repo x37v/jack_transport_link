@@ -143,7 +143,7 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
 
   //TODO in follower mode, always report transport state changes,
   //also, mBPM won't contain a valid BPM for the transport
-  
+
   //when the session state is stopped, timeBaseCallback isn't called, so we report start/stop in the processCallback
   auto transportState = jack_transport_query(mJackClient, &pos);
   bool bbtValid = pos.valid & JackPositionBBT;
@@ -266,7 +266,7 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
       invalidateClockSyncBBT();
     }
   }
-#else 
+#else
   if (mClickPort != nullptr) {
     jack_default_audio_sample_t * buf = reinterpret_cast<jack_default_audio_sample_t *>(jack_port_get_buffer(mClickPort, nframes));
 
@@ -338,17 +338,10 @@ void JackTransportLink::timeBaseCallback(jack_transport_state_t transportState, 
   auto linkTime = mTime;
 
 #ifndef USE_INTERNAL_BEAT
-  double linkBeat = std::max(0.0, sessionState.beatAtTime(linkTime, quantum));
+  double linkBeat = sessionState.beatAtTime(linkTime, quantum);
 #else
   double linkBeat = mInternalBeat;
 #endif
-
-  //TODO handle negative
-  if (linkBeat < 0.0) {
-    linkBeat = 0.0;
-  }
-
-  double tickCurrent = linkBeat * ticksPerBeat;
 
 #ifndef USE_INTERNAL_BEAT
   if (posIsNew) {
@@ -375,7 +368,6 @@ void JackTransportLink::timeBaseCallback(jack_transport_state_t transportState, 
       linkBeat = 0.0;
       //std::cout << "beat is negative: " << linkBeat << std::endl;
     }
-    tickCurrent = linkBeat * ticksPerBeat;
 
     //need to sync again since we repositioned
     mMIDIClockRunState = MIDIClockRunState::NeedsSync;
@@ -387,7 +379,7 @@ void JackTransportLink::timeBaseCallback(jack_transport_state_t transportState, 
   auto bar = std::floor(linkBeat / quantum);
   auto beat = std::fmod(linkBeat, quantum);
   auto tick = trunc(ticksPerBeat * (beat - trunc(beat)));
-  float beatType = bbtValid ? pos->beat_type : mInitialTimeSigDenom; 
+  float beatType = bbtValid ? pos->beat_type : mInitialTimeSigDenom;
 
   pos->valid = JackPositionBBT;
   pos->bar = static_cast<int32_t>(bar) + 1;
@@ -404,7 +396,7 @@ void JackTransportLink::timeBaseCallback(jack_transport_state_t transportState, 
     mInternalBeat += bpm * static_cast<double>(nframes) / (static_cast<double>(jack_get_sample_rate(mJackClient)) * 60.0);
   }
 #endif
-} 
+}
 
 int JackTransportLink::syncCallback(jack_transport_state_t state, jack_position_t *pos, void *arg) {
   return reinterpret_cast<JackTransportLink *>(arg)->syncCallback(state, pos);
