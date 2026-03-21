@@ -364,10 +364,6 @@ void JackTransportLink::timeBaseCallback(jack_transport_state_t transportState, 
 
     mLink.commitAudioSessionState(sessionState);
     linkBeat = sessionState.beatAtTime(linkTime, quantum);
-    if (linkBeat < 0.0) {
-      linkBeat = 0.0;
-      //std::cout << "beat is negative: " << linkBeat << std::endl;
-    }
 
     //need to sync again since we repositioned
     mMIDIClockRunState = MIDIClockRunState::NeedsSync;
