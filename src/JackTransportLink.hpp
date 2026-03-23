@@ -11,6 +11,13 @@
 #include <ableton/link/HostTimeFilter.hpp>
 #include <ableton/platforms/Config.hpp>
 
+///XXX OSC CONTROL??
+///
+///position
+///start/stop
+///bpm??
+///sync to link vs internal?
+
 class JackTransportLink {
   public:
     enum class MIDIClockRunState {
@@ -53,6 +60,7 @@ class JackTransportLink {
 
     jack_port_t * mClickPort = nullptr;
     double mInternalBeat = 0.0;
+    bool mSyncLink = true;
 
     int32_t mBeatLast = -1;
     int32_t mBarLast = -1;
