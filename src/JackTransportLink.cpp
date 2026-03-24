@@ -34,7 +34,7 @@ bool get_property(jack_uuid_t subject, const std::string &key,
   if (jack_get_property(subject, key.c_str(), &values, &types) != 0)
     return false;
   value_out = std::string(values);
-  type_out = std::string(type_out);
+  type_out = std::string(types);
   if (values)
     jack_free(values);
   if (types)
@@ -104,6 +104,9 @@ JackTransportLink::JackTransportLink(jack_client_t *client,
       setEnableStartStopProperty(mLink.isStartStopSyncEnabled());
       jack_set_property_change_callback(
           mJackClient, JackTransportLink::propertyChangeCallback, this);
+    }
+    if (uuids) {
+      jack_free(uuids);
     }
   }
 
@@ -517,12 +520,12 @@ void JackTransportLink::propertyChangeCallback(jack_uuid_t subject,
                                                jack_property_change_t change) {
   // if the subject is all or us and the key is all (empty) or bpm
   if ((jack_uuid_empty(subject) || subject == mJackClientUUID)) {
-    bool bpm = !key || bpm_key.compare(key) == 0;
+    bool isbpm = !key || bpm_key.compare(key) == 0;
     bool enable = !key || start_stop_key.compare(key) == 0;
     if (change == jack_property_change_t::PropertyChanged) {
       std::string values;
       std::string types;
-      if (bpm && get_property(mJackClientUUID, bpm_key, values, types)) {
+      if (isbpm && get_property(mJackClientUUID, bpm_key, values, types)) {
         // convert to double and store if success
         char *pEnd = nullptr;
         double bpm = std::strtod(values.c_str(), &pEnd);
@@ -536,7 +539,7 @@ void JackTransportLink::propertyChangeCallback(jack_uuid_t subject,
         mLink.enableStartStopSync(set);
       }
     } else if (change == jack_property_change_t::PropertyDeleted) {
-      if (bpm)
+      if (isbpm)
         setBPMProperty(mBPM.load(std::memory_order_acquire));
       if (enable)
         setEnableStartStopProperty(mLink.isStartStopSyncEnabled());
