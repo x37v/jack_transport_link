@@ -50,6 +50,8 @@ include_directories(
 	${JACK_INCLUDE_DIR}
 )
 
+add_subdirectory(./3rdparty/oscpack/)
+
 if (UNIX)
   if (LINUX)
     set(PLATFORM_LIBS "-latomic -lpthread")
@@ -70,6 +72,7 @@ target_link_libraries(
   Ableton::Link
 	${JACK_LIB}
 )
+target_link_libraries(${PROJECT_APP} PRIVATE oscpack)
 
 install(TARGETS ${PROJECT_APP} DESTINATION bin)
 
