@@ -4,3 +4,6 @@
 [submodule "3rdparty/cpp-optparse"]
 	path = 3rdparty/cpp-optparse
 	url = https://github.com/weisslj/cpp-optparse
+[submodule "3rdparty/oscpack"]
+	path = 3rdparty/oscpack
+	url = https://github.com/Cycling74/oscpack.git
