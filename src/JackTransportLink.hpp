@@ -70,8 +70,6 @@ private:
   bool mSyncLink = true;
   bool mWasSyncLink = true;
 
-  std::atomic<double> mBeatRequest;
-
   int32_t mBeatLast = -1;
   int32_t mBarLast = -1;
   double mTickLast = -1.0;

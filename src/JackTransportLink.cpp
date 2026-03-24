@@ -170,10 +170,7 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
 
   jack_position_t pos;
 
-  double beatrequest = mBeatRequest.exchange(-1.0);
-  if (beatrequest >= 0.0) {
-    mInternalBeat = beatrequest;
-  }
+  double beatrequest = -1.0;
 
   // if sync has changed, and we are now syncing, we request the beat we're at
   if (mSyncLink != mWasSyncLink) {
@@ -440,8 +437,6 @@ void JackTransportLink::timeBaseCallback(jack_transport_state_t transportState,
     mInternalBeat = sessionState.beatAtTime(linkTime, mQuantum);
   }
 
-  // using OSC instead
-#if 0
   if (posIsNew) {
     /*
      *  copied from transport.c -- JACK transport master example client.
@@ -449,19 +444,19 @@ void JackTransportLink::timeBaseCallback(jack_transport_state_t transportState,
      *  Copyright (C) 2003 Jack O'Quin.
      */
 
-    // beat/tick etc after a seek are simply based onf frame and the current bpm
+    // beat/tick etc after a seek are simply based on frame and the current bpm
     double min = pos->frame / ((double)pos->frame_rate * 60.0);
     double abs_tick = min * pos->beats_per_minute * pos->ticks_per_beat;
     double abs_beat = abs_tick / pos->ticks_per_beat;
 
-    std::cout << "posIsNew " << abs_beat << std::endl;
-
     mInternalBeat = abs_beat;
 
     if (sync) {
-      // use frame to compute the beat
-      sessionState.requestBeatAtTime(mInternalBeat, linkTime, mQuantum);
-
+      if (mLink.numPeers() > 1) {
+        sessionState.requestBeatAtTime(mInternalBeat, linkTime, mQuantum);
+      } else {
+        sessionState.forceBeatAtTime(mInternalBeat, linkTime, mQuantum);
+      }
       mLink.commitAudioSessionState(sessionState);
       mInternalBeat = sessionState.beatAtTime(linkTime, mQuantum);
     }
@@ -470,7 +465,6 @@ void JackTransportLink::timeBaseCallback(jack_transport_state_t transportState,
     mMIDIClockRunState = MIDIClockRunState::NeedsSync;
     invalidateClockSyncBBT();
   }
-#endif
 
   // what if quantum changes? Does link keep track of that or should we compute
   // bar some other way?
@@ -588,7 +582,16 @@ void JackTransportLink::ProcessMessage(
       if (arg != m.ArgumentsEnd()) {
         std::optional<double> v = GetOscDouble(*arg);
         if (v && *v >= 0.0) {
-          mBeatRequest.store(*v);
+          jack_position_t pos;
+          jack_transport_query(mJackClient, &pos);
+
+          const double tpb = static_cast<double>(pos.ticks_per_beat);
+          double abs_tick = *v * tpb;
+          double minute =
+              abs_tick / (static_cast<double>(pos.beats_per_minute) * tpb);
+          pos.frame = minute * static_cast<double>(pos.frame_rate) * 60.0;
+
+          jack_transport_reposition(mJackClient, &pos);
         }
       }
     } else if (std::strcmp("/jacklink/sync", m.AddressPattern()) == 0) {
