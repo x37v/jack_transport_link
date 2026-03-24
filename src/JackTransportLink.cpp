@@ -2,6 +2,7 @@
 
 #include <jack/midiport.h>
 #include <jack/uuid.h>
+#include <optional>
 #include <string>
 
 // debugging defines
@@ -41,6 +42,23 @@ bool get_property(jack_uuid_t subject, const std::string &key,
   return true;
 }
 
+std::optional<double>
+GetOscDouble(const oscpack::ReceivedMessageArgument &arg) {
+  if (arg.IsDouble()) {
+    return arg.AsDoubleUnchecked();
+  }
+  if (arg.IsFloat()) {
+    return static_cast<double>(arg.AsFloatUnchecked());
+  }
+  if (arg.IsInt64()) {
+    return static_cast<double>(arg.AsInt64());
+  }
+  if (arg.IsInt32()) {
+    return static_cast<double>(arg.AsInt32());
+  }
+  return std::nullopt;
+}
+
 } // namespace
 
 JackTransportLink::JackTransportLink(jack_client_t *client,
@@ -49,7 +67,7 @@ JackTransportLink::JackTransportLink(jack_client_t *client,
                                      float initialTimeSigDenom,
                                      double initialTicksPerBeat)
     : mJackClient(client), mBPM(initialBPM), mBPMLast(initialBPM),
-      mInitialQuantum(initialQuantum),
+      mQuantum(initialQuantum), mInitialQuantum(initialQuantum),
       mInitialTimeSigDenom(initialTimeSigDenom),
       mInitialTicksPerBeat(initialTicksPerBeat), mLink(initialBPM),
       mJackClientUUID(0) {
@@ -149,6 +167,19 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
 
   jack_position_t pos;
 
+  double beatrequest = mBeatRequest.exchange(-1.0);
+  if (beatrequest >= 0.0) {
+    mInternalBeat = beatrequest;
+  }
+
+  // if sync has changed, and we are now syncing, we request the beat we're at
+  if (mSyncLink != mWasSyncLink) {
+    mWasSyncLink = mSyncLink;
+    if (mSyncLink) {
+      beatrequest = mInternalBeat; // might already be equal from above
+    }
+  }
+
   // TODO in follower mode, always report transport state changes,
   // also, mBPM won't contain a valid BPM for the transport
 
@@ -161,17 +192,46 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
   bool stateChange = transportState != mTransportStateReportedLast;
   double bpm = mBPM.load(std::memory_order_acquire);
   bool bpmChange = bbtValid && pos.beats_per_minute != bpm;
-  if (mSyncLink && (stateChange || bpmChange)) {
+  auto linkTime = mTimeNext; // now plus some latency
+  if (mSyncLink && (stateChange || bpmChange || beatrequest >= 0.0)) {
+    // I'm seeing numPeers() as 1 even if I'm the only link on my network, this
+    // doesn't seem to align with the naming
+    bool havePeers = mLink.numPeers() > 1;
     auto sessionState = mLink.captureAudioSessionState();
     if (stateChange) {
-      sessionState.setIsPlaying(rolling, mTime);
+      sessionState.setIsPlaying(rolling, linkTime);
+      // request beat while starting (or if we missed staring somehow)
+      if (transportState == jack_transport_state_t::JackTransportStarting ||
+          (transportState == jack_transport_state_t::JackTransportRolling &&
+           mTransportStateReportedLast !=
+               jack_transport_state_t::JackTransportStarting)) {
+        if (havePeers) {
+          sessionState.requestBeatAtStartPlayingTime(mInternalBeat, mQuantum);
+        } else {
+          sessionState.forceBeatAtTime(mInternalBeat, linkTime, mQuantum);
+          beatrequest = -1.0;
+        }
+      }
       mTransportStateReportedLast = transportState;
     }
     if (bpmChange) {
-      sessionState.setTempo(bpm, mTime);
+      sessionState.setTempo(bpm, linkTime);
       mBPMLast = bpm;
     }
+
+    if (beatrequest >= 0) {
+      if (havePeers) {
+        sessionState.requestBeatAtTime(mInternalBeat, linkTime, mQuantum);
+      } else {
+        sessionState.forceBeatAtTime(mInternalBeat, linkTime, mQuantum);
+      }
+    }
     mLink.commitAudioSessionState(sessionState);
+  }
+
+  if (beatrequest >= 0.0) {
+    mMIDIClockRunState = MIDIClockRunState::NeedsSync;
+    invalidateClockSyncBBT();
   }
 
 #ifndef DO_CLICK_OUT
@@ -367,17 +427,17 @@ void JackTransportLink::timeBaseCallback(jack_transport_state_t transportState,
   bool bbtValid = pos->valid & JackPositionBBT;
 
   double bpm = mBPM.load(std::memory_order_acquire);
-  double quantum = bbtValid ? pos->beats_per_bar : mInitialQuantum;
+  mQuantum = bbtValid ? pos->beats_per_bar : mInitialQuantum;
   double ticksPerBeat = bbtValid ? pos->ticks_per_beat : mInitialTicksPerBeat;
 
   auto linkTime = mTime;
+  auto sync = mSyncLink;
 
-  double linkBeat;
-  if (mSyncLink) {
-    linkBeat = sessionState.beatAtTime(linkTime, quantum);
-  } else {
-    linkBeat = mInternalBeat;
+  if (sync) {
+    mInternalBeat = sessionState.beatAtTime(linkTime, mQuantum);
   }
+
+#if 0
   if (posIsNew) {
     /*
      *  copied from transport.c -- JACK transport master example client.
@@ -390,25 +450,28 @@ void JackTransportLink::timeBaseCallback(jack_transport_state_t transportState,
     double abs_tick = min * pos->beats_per_minute * pos->ticks_per_beat;
     double abs_beat = abs_tick / pos->ticks_per_beat;
 
-    linkBeat = abs_beat;
+    std::cout << "posIsNew " << abs_beat << std::endl;
 
-    if (mSyncLink) {
+    mInternalBeat = abs_beat;
+
+    if (sync) {
       // use frame to compute the beat
-      sessionState.requestBeatAtTime(linkBeat, linkTime, quantum);
+      sessionState.requestBeatAtTime(mInternalBeat, linkTime, mQuantum);
 
       mLink.commitAudioSessionState(sessionState);
-      linkBeat = sessionState.beatAtTime(linkTime, quantum);
+      mInternalBeat = sessionState.beatAtTime(linkTime, mQuantum);
     }
 
     // need to sync again since we repositioned
     mMIDIClockRunState = MIDIClockRunState::NeedsSync;
     invalidateClockSyncBBT();
   }
+#endif
 
   // what if quantum changes? Does link keep track of that or should we compute
   // bar some other way?
-  auto bar = std::floor(linkBeat / quantum);
-  auto beat = std::fmod(linkBeat, quantum);
+  auto bar = std::floor(mInternalBeat / mQuantum);
+  auto beat = std::fmod(mInternalBeat, mQuantum);
   auto tick = trunc(ticksPerBeat * (beat - trunc(beat)));
   float beatType = bbtValid ? pos->beat_type : mInitialTimeSigDenom;
 
@@ -416,14 +479,13 @@ void JackTransportLink::timeBaseCallback(jack_transport_state_t transportState,
   pos->bar = static_cast<int32_t>(bar) + 1;
   pos->beat = static_cast<int32_t>(beat) + 1;
   pos->tick = static_cast<int32_t>(tick);
-  pos->bar_start_tick = bar * quantum * ticksPerBeat;
-  pos->beats_per_bar = static_cast<float>(quantum);
+  pos->bar_start_tick = bar * mQuantum * ticksPerBeat;
+  pos->beats_per_bar = static_cast<float>(mQuantum);
   pos->beat_type = beatType;
   pos->ticks_per_beat = ticksPerBeat;
   pos->beats_per_minute = bpm;
 
-  if (!mSyncLink &&
-      transportState == jack_transport_state_t::JackTransportRolling) {
+  if (!sync && transportState == jack_transport_state_t::JackTransportRolling) {
     mInternalBeat +=
         bpm * static_cast<double>(nframes) /
         (static_cast<double>(jack_get_sample_rate(mJackClient)) * 60.0);
@@ -506,5 +568,41 @@ void JackTransportLink::invalidateClockSyncBBT() {
 void JackTransportLink::ProcessMessage(
     const oscpack::ReceivedMessage &m,
     const oscpack::IpEndpointName &remoteEndpoint) {
-  std::cout << "got osc message " << m.AddressPattern() << std::endl;
+  try {
+    oscpack::ReceivedMessageArgumentStream args = m.ArgumentStream();
+    oscpack::ReceivedMessage::const_iterator arg = m.ArgumentsBegin();
+    // std::cout << "got osc message " << m.AddressPattern() << std::endl;
+    if (std::strcmp("/jacklink/bpm", m.AddressPattern()) == 0) {
+      if (arg != m.ArgumentsEnd()) {
+        std::optional<double> v = GetOscDouble(*arg);
+        if (v && *v > 0.0) {
+          mBPM.store(*v);
+          setBPMProperty(*v);
+        }
+      }
+    } else if (std::strcmp("/jacklink/beattime", m.AddressPattern()) == 0) {
+      if (arg != m.ArgumentsEnd()) {
+        std::optional<double> v = GetOscDouble(*arg);
+        if (v && *v >= 0.0) {
+          mBeatRequest.store(*v);
+        }
+      }
+    } else if (std::strcmp("/jacklink/sync", m.AddressPattern()) == 0) {
+      if (arg != m.ArgumentsEnd() && arg->IsBool()) {
+        mSyncLink = arg->AsBoolUnchecked();
+      }
+    } else if (std::strcmp("/jacklink/rolling", m.AddressPattern()) == 0) {
+      if (arg != m.ArgumentsEnd() && arg->IsBool()) {
+        bool rolling = arg->AsBoolUnchecked();
+        if (rolling) {
+          jack_transport_start(mJackClient);
+        } else {
+          jack_transport_stop(mJackClient);
+        }
+      }
+    }
+  } catch (oscpack::Exception &e) {
+    std::cerr << "error while parsing message: " << m.AddressPattern() << ": "
+              << e.what() << "\n";
+  }
 }

@@ -62,12 +62,15 @@ private:
   jack_port_t *mMIDIClockOut = nullptr;
   MIDIClockRunState mMIDIClockRunState = MIDIClockRunState::Stopped;
   int mMIDIClockCount = 0;
-  double mClockFrameDelay =
-      0; // first clock tick gets a delay, track it across process calls
+  // first clock tick gets a delay, track it across process calls
+  double mClockFrameDelay = 0;
 
   jack_port_t *mClickPort = nullptr;
   double mInternalBeat = 0.0;
   bool mSyncLink = true;
+  bool mWasSyncLink = true;
+
+  std::atomic<double> mBeatRequest;
 
   int32_t mBeatLast = -1;
   int32_t mBarLast = -1;
@@ -81,6 +84,7 @@ private:
 
   std::atomic<double> mBPM;
   double mBPMLast;
+  double mQuantum;
   double mInitialQuantum; // time sig num, called quantum in link
   float mInitialTimeSigDenom;
   double mInitialTicksPerBeat;
