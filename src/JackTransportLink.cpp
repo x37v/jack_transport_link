@@ -437,6 +437,7 @@ void JackTransportLink::timeBaseCallback(jack_transport_state_t transportState,
     mInternalBeat = sessionState.beatAtTime(linkTime, mQuantum);
   }
 
+  // using OSC instead
 #if 0
   if (posIsNew) {
     /*
