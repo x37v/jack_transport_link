@@ -53,6 +53,8 @@ JackTransportLink::JackTransportLink(jack_client_t *client,
       mInitialTimeSigDenom(initialTimeSigDenom),
       mInitialTicksPerBeat(initialTicksPerBeat), mLink(initialBPM),
       mJackClientUUID(0) {
+  // setup listener
+
   // setup link
   mLink.setTempoCallback([this](double bpm) {
     mBPM.store(bpm, std::memory_order_release);
@@ -157,7 +159,7 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
   // always considered "playing" if it isn't stopped
   auto rolling = transportState != jack_transport_state_t::JackTransportStopped;
   bool stateChange = transportState != mTransportStateReportedLast;
-	double bpm = mBPM.load(std::memory_order_acquire);
+  double bpm = mBPM.load(std::memory_order_acquire);
   bool bpmChange = bbtValid && pos.beats_per_minute != bpm;
   if (mSyncLink && (stateChange || bpmChange)) {
     auto sessionState = mLink.captureAudioSessionState();
@@ -499,4 +501,10 @@ void JackTransportLink::invalidateClockSyncBBT() {
   mBeatLast = -1;
   mBarLast = -1;
   mTickLast = -1.0;
+}
+
+void JackTransportLink::ProcessMessage(
+    const oscpack::ReceivedMessage &m,
+    const oscpack::IpEndpointName &remoteEndpoint) {
+  std::cout << "got osc message " << m.AddressPattern() << std::endl;
 }
