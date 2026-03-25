@@ -98,7 +98,7 @@ int main(int argc, char *argv[]) {
       .help("the name to give to the jack client, default: %default")
       .action("store")
       .dest("oscport")
-      .set_default("3456");
+      .set_default("-1");
 
   // process args
   optparse::Values options = parser.parse_args(argc, argv);
