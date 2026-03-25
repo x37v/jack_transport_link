@@ -18,6 +18,7 @@ namespace {
 const char *decimal_type = "https://www.w3.org/2001/XMLSchema#decimal";
 const char *bool_type = "https://www.w3.org/2001/XMLSchema#boolean";
 const std::string bpm_key("http://www.x37v.info/jack/metadata/bpm");
+const std::string linksync_key("http://www.x37v.info/jack/metadata/linksync");
 const std::string
     start_stop_key("http://www.x37v.info/jack/metadata/link/start-stop-sync");
 const std::array<std::string, 2> true_values = {"true", "1"};
@@ -33,12 +34,14 @@ bool get_property(jack_uuid_t subject, const std::string &key,
   char *types = nullptr;
   if (jack_get_property(subject, key.c_str(), &values, &types) != 0)
     return false;
-  value_out = std::string(values);
-  type_out = std::string(types);
-  if (values)
+  if (values) {
+    value_out = std::string(values);
     jack_free(values);
-  if (types)
+  }
+  if (types) {
+    type_out = std::string(types);
     jack_free(types);
+  }
   return true;
 }
 
@@ -102,6 +105,7 @@ JackTransportLink::JackTransportLink(jack_client_t *client,
         jack_uuid_parse(uuids, &mJackClientUUID) == 0) {
       setBPMProperty(mBPM.load(std::memory_order_acquire));
       setEnableStartStopProperty(mLink.isStartStopSyncEnabled());
+      setSyncProperty(mSyncLink);
       jack_set_property_change_callback(
           mJackClient, JackTransportLink::propertyChangeCallback, this);
     }
@@ -515,7 +519,8 @@ void JackTransportLink::propertyChangeCallback(jack_uuid_t subject,
   // if the subject is all or us and the key is all (empty) or bpm
   if ((jack_uuid_empty(subject) || subject == mJackClientUUID)) {
     bool isbpm = !key || bpm_key.compare(key) == 0;
-    bool enable = !key || start_stop_key.compare(key) == 0;
+    bool islinksync = !key || linksync_key.compare(key) == 0;
+    bool isenable = !key || start_stop_key.compare(key) == 0;
     if (change == jack_property_change_t::PropertyChanged) {
       std::string values;
       std::string types;
@@ -525,18 +530,23 @@ void JackTransportLink::propertyChangeCallback(jack_uuid_t subject,
         double bpm = std::strtod(values.c_str(), &pEnd);
         if (*pEnd == 0)
           mBPM.store(bpm, std::memory_order_release);
-      }
-      if (enable &&
-          get_property(mJackClientUUID, start_stop_key, values, types)) {
+      } else if (isenable &&
+                 get_property(mJackClientUUID, start_stop_key, values, types)) {
         bool set = std::find(true_values.begin(), true_values.end(), values) !=
                    true_values.end();
         mLink.enableStartStopSync(set);
+      } else if (islinksync &&
+                 get_property(mJackClientUUID, linksync_key, values, types)) {
+        mSyncLink = std::find(true_values.begin(), true_values.end(), values) !=
+                    true_values.end();
       }
     } else if (change == jack_property_change_t::PropertyDeleted) {
       if (isbpm)
         setBPMProperty(mBPM.load(std::memory_order_acquire));
-      if (enable)
+      if (isenable)
         setEnableStartStopProperty(mLink.isStartStopSyncEnabled());
+      if (islinksync)
+        setSyncProperty(mSyncLink);
     }
   }
 }
@@ -554,6 +564,14 @@ void JackTransportLink::setEnableStartStopProperty(bool enable) {
     std::string enables = enable ? "true" : "false";
     jack_set_property(mJackClient, mJackClientUUID, start_stop_key.c_str(),
                       enables.c_str(), bool_type);
+  }
+}
+
+void JackTransportLink::setSyncProperty(bool sync) {
+  if (!jack_uuid_empty(mJackClientUUID)) {
+    std::string s = sync ? "true" : "false";
+    jack_set_property(mJackClient, mJackClientUUID, linksync_key.c_str(),
+                      s.c_str(), bool_type);
   }
 }
 
@@ -597,6 +615,7 @@ void JackTransportLink::ProcessMessage(
     } else if (std::strcmp("/jacklink/sync", m.AddressPattern()) == 0) {
       if (arg != m.ArgumentsEnd() && arg->IsBool()) {
         mSyncLink = arg->AsBoolUnchecked();
+        setSyncProperty(mSyncLink);
       }
     } else if (std::strcmp("/jacklink/rolling", m.AddressPattern()) == 0) {
       if (arg != m.ArgumentsEnd() && arg->IsBool()) {

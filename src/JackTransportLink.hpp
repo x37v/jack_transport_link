@@ -53,6 +53,7 @@ private:
                               jack_property_change_t change);
   void setBPMProperty(double bpm);
   void setEnableStartStopProperty(bool enable);
+  void setSyncProperty(bool sync);
 
   void invalidateClockSyncBBT();
 
