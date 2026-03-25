@@ -69,8 +69,8 @@ JackTransportLink::JackTransportLink(jack_client_t *client,
                                      double initialBPM, double initialQuantum,
                                      float initialTimeSigDenom,
                                      double initialTicksPerBeat)
-    : mJackClient(client), mBPM(initialBPM), mBPMLast(initialBPM),
-      mQuantum(initialQuantum), mInitialQuantum(initialQuantum),
+    : mJackClient(client), mBPM(initialBPM), mQuantum(initialQuantum),
+      mInitialQuantum(initialQuantum),
       mInitialTimeSigDenom(initialTimeSigDenom),
       mInitialTicksPerBeat(initialTicksPerBeat), mLink(initialBPM),
       mJackClientUUID(0) {
@@ -78,12 +78,15 @@ JackTransportLink::JackTransportLink(jack_client_t *client,
 
   // setup link
   mLink.setTempoCallback([this](double bpm) {
-    mBPM.store(bpm, std::memory_order_release);
-    setBPMProperty(bpm);
+    mLinkBPM = bpm;
+    if (mSyncLink) {
+      mBPM.store(bpm, std::memory_order_release);
+      mReportBPM = true;
+    }
   });
   if (enableStartStopSync) {
     mLink.setStartStopCallback([this](bool isPlaying) {
-      if (mLink.isStartStopSyncEnabled()) {
+      if (mLink.isStartStopSyncEnabled() && mSyncLink) {
         if (isPlaying) {
           jack_transport_start(mJackClient);
         } else {
@@ -140,12 +143,27 @@ JackTransportLink::~JackTransportLink() {
   jack_client_close(mJackClient);
 }
 
+void JackTransportLink::processEvents() {
+  if (mReportBPM) {
+    mReportBPM = false;
+    setBPMProperty(mBPM.load(std::memory_order_acquire));
+  }
+  if (mReportLinkSync) {
+    mReportLinkSync = false;
+    setSyncProperty(mSyncLink);
+  }
+  if (mReportStartStopEnable) {
+    mReportStartStopEnable = false;
+    setEnableStartStopProperty(mLink.isStartStopSyncEnabled());
+  }
+}
+
 int JackTransportLink::processCallback(jack_nframes_t nframes, void *arg) {
   return reinterpret_cast<JackTransportLink *>(arg)->processCallback(nframes);
 }
 
-void updateBBT(int32_t &bar, int32_t &beat, double &tick,
-               double ticks_per_beat, int beats_per_bar) {
+void updateBBT(int32_t &bar, int32_t &beat, double &tick, double ticks_per_beat,
+               int beats_per_bar) {
   if (tick >= ticks_per_beat) {
     beat += 1;
     tick = std::fmod(tick, ticks_per_beat);
@@ -219,7 +237,6 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
     }
     if (bpmChange) {
       sessionState.setTempo(bpm, linkTime);
-      mBPMLast = bpm;
     }
 
     if (beatrequest >= 0) {
@@ -322,8 +339,7 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
           jack_midi_event_write(midi_buf, f, midi_clock_buf.data(),
                                 midi_clock_buf.size());
           mMIDIClockCount = (mMIDIClockCount + 1) % MIDI_PPQ;
-        } else if (beat == 0 && tick < ticksPerClock && tick >= 0 &&
-                   bar >= 0) {
+        } else if (beat == 0 && tick < ticksPerClock && tick >= 0 && bar >= 0) {
           // see if we need to send a start
           mMIDIClockRunState = MIDIClockRunState::Running;
 #ifndef MIDI_SEND_REPEATED_STARTS
@@ -540,16 +556,23 @@ void JackTransportLink::propertyChangeCallback(jack_uuid_t subject,
         mLink.enableStartStopSync(set);
       } else if (islinksync &&
                  get_property(mJackClientUUID, linksync_key, values, types)) {
+
+        bool was = mSyncLink;
         mSyncLink = std::find(true_values.begin(), true_values.end(), values) !=
                     true_values.end();
+
+        if (mSyncLink && !was) {
+          mBPM.store(mLinkBPM, std::memory_order_release);
+          mReportBPM = true;
+        }
       }
     } else if (change == jack_property_change_t::PropertyDeleted) {
       if (isbpm)
-        setBPMProperty(mBPM.load(std::memory_order_acquire));
+        mReportBPM = true;
       if (isenable)
-        setEnableStartStopProperty(mLink.isStartStopSyncEnabled());
+        mReportStartStopEnable = true;
       if (islinksync)
-        setSyncProperty(mSyncLink);
+        mReportLinkSync = true;
     }
   }
 }
@@ -596,7 +619,7 @@ void JackTransportLink::ProcessMessage(
         std::optional<double> v = GetOscDouble(*arg);
         if (v && *v > 0.0) {
           mBPM.store(*v);
-          setBPMProperty(*v);
+          mReportBPM = true;
         }
       }
     } else if (std::strcmp("/jacklink/beattime", m.AddressPattern()) == 0) {
@@ -617,7 +640,12 @@ void JackTransportLink::ProcessMessage(
       }
     } else if (std::strcmp("/jacklink/sync", m.AddressPattern()) == 0) {
       if (arg != m.ArgumentsEnd() && arg->IsBool()) {
+        bool was = mSyncLink;
         mSyncLink = arg->AsBoolUnchecked();
+        if (mSyncLink && !was) {
+          mBPM.store(mLinkBPM, std::memory_order_release);
+          mReportBPM = true;
+        }
         setSyncProperty(mSyncLink);
       }
     } else if (std::strcmp("/jacklink/rolling", m.AddressPattern()) == 0) {

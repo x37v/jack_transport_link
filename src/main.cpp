@@ -159,6 +159,7 @@ int main(int argc, char *argv[]) {
 
       while (run.load() && runSession.load()) {
         std::this_thread::sleep_for(runPollPeriod);
+        j.processEvents();
       }
 
       // cleanup osc

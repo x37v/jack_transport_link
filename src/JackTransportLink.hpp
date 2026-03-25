@@ -31,6 +31,8 @@ public:
                     double initialTicksPerBeat = 1920.);
   ~JackTransportLink();
 
+  void processEvents();
+
   static int processCallback(jack_nframes_t nframes, void *arg);
   static void timeBaseCallback(jack_transport_state_t state,
                                jack_nframes_t nframes, jack_position_t *pos,
@@ -82,6 +84,7 @@ private:
       jack_transport_state_t::JackTransportStopped;
 
   std::atomic<double> mBPM;
+  double mLinkBPM;
   double mBPMLast;
   double mQuantum;
   double mInitialQuantum; // time sig num, called quantum in link
@@ -89,4 +92,8 @@ private:
   double mInitialTicksPerBeat;
 
   jack_uuid_t mJackClientUUID;
+
+  bool mReportBPM = false;
+  bool mReportLinkSync = false;
+  bool mReportStartStopEnable = false;
 };
