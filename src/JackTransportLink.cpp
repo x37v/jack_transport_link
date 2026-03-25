@@ -198,9 +198,8 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
   bool bpmChange = bbtValid && pos.beats_per_minute != bpm;
   auto linkTime = mTimeNext; // now plus some latency
   if (mSyncLink && (stateChange || bpmChange || beatrequest >= 0.0)) {
-    // I'm seeing numPeers() as 1 even if I'm the only link on my network, this
-    // doesn't seem to align with the naming
-    bool havePeers = mLink.numPeers() > 1;
+    // if peers are 0 then we don't know, if they're 1 then its just us
+    bool havePeers = mLink.numPeers() != 1;
     auto sessionState = mLink.captureAudioSessionState();
     if (stateChange) {
       sessionState.setIsPlaying(rolling, linkTime);
@@ -456,7 +455,8 @@ void JackTransportLink::timeBaseCallback(jack_transport_state_t transportState,
     mInternalBeat = abs_beat;
 
     if (sync) {
-      if (mLink.numPeers() > 1) {
+      // if peers are 0 then we don't know, if they're 1 then its just us
+      if (mLink.numPeers() != 1) {
         sessionState.requestBeatAtTime(mInternalBeat, linkTime, mQuantum);
       } else {
         sessionState.forceBeatAtTime(mInternalBeat, linkTime, mQuantum);
