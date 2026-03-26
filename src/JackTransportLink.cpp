@@ -20,7 +20,8 @@ const char *int_type = "https://www.w3.org/2001/XMLSchema#integer";
 const char *bool_type = "https://www.w3.org/2001/XMLSchema#boolean";
 const std::string bpm_key("http://www.x37v.info/jack/metadata/bpm");
 const std::string linksync_key("http://www.x37v.info/jack/metadata/linksync");
-const std::string numpeers_key("http://www.x37v.info/jack/metadata/linkpeers");
+const std::string
+    linknumpeers_key("http://www.x37v.info/jack/metadata/linkpeers");
 const std::string
     start_stop_key("http://www.x37v.info/jack/metadata/link/start-stop-sync");
 const std::array<std::string, 2> true_values = {"true", "1"};
@@ -224,8 +225,7 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
   bool bpmChange = bbtValid && pos.beats_per_minute != bpm;
   auto linkTime = mTimeNext; // now plus some latency
   if (mSyncLink && (stateChange || bpmChange || beatrequest >= 0.0)) {
-    // if peers are 0 then we don't know, if they're 1 then its just us
-    bool havePeers = mLink.numPeers() != 1;
+    bool havePeers = mLink.numPeers() > 0;
     auto sessionState = mLink.captureAudioSessionState();
     if (stateChange) {
       sessionState.setIsPlaying(rolling, linkTime);
@@ -482,8 +482,7 @@ void JackTransportLink::timeBaseCallback(jack_transport_state_t transportState,
     mInternalBeat = abs_beat;
 
     if (sync) {
-      // if peers are 0 then we don't know, if they're 1 then its just us
-      if (mLink.numPeers() != 1) {
+      if (mLink.numPeers() > 0) {
         sessionState.requestBeatAtTime(mInternalBeat, linkTime, mQuantum);
       } else {
         sessionState.forceBeatAtTime(mInternalBeat, linkTime, mQuantum);
@@ -612,7 +611,7 @@ void JackTransportLink::setSyncProperty(bool sync) {
 void JackTransportLink::setNumPeersProperty(size_t peers) {
   if (!jack_uuid_empty(mJackClientUUID)) {
     std::string s = std::to_string(peers);
-    jack_set_property(mJackClient, mJackClientUUID, numpeers_key.c_str(),
+    jack_set_property(mJackClient, mJackClientUUID, linknumpeers_key.c_str(),
                       s.c_str(), int_type);
   }
 }
