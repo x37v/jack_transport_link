@@ -56,6 +56,7 @@ private:
   void setBPMProperty(double bpm);
   void setEnableStartStopProperty(bool enable);
   void setSyncProperty(bool sync);
+  void setNumPeersProperty(size_t peers);
 
   void invalidateClockSyncBBT();
 

@@ -16,9 +16,11 @@
 
 namespace {
 const char *decimal_type = "https://www.w3.org/2001/XMLSchema#decimal";
+const char *int_type = "https://www.w3.org/2001/XMLSchema#integer";
 const char *bool_type = "https://www.w3.org/2001/XMLSchema#boolean";
 const std::string bpm_key("http://www.x37v.info/jack/metadata/bpm");
 const std::string linksync_key("http://www.x37v.info/jack/metadata/linksync");
+const std::string numpeers_key("http://www.x37v.info/jack/metadata/linkpeers");
 const std::string
     start_stop_key("http://www.x37v.info/jack/metadata/link/start-stop-sync");
 const std::array<std::string, 2> true_values = {"true", "1"};
@@ -96,9 +98,11 @@ JackTransportLink::JackTransportLink(jack_client_t *client,
     });
   }
   mLink.enableStartStopSync(enableStartStopSync);
+  mLink.setNumPeersCallback(
+      [this](std::size_t numPeers) { setNumPeersProperty(numPeers); });
   mLink.enable(true);
 
-  // intialize our bpm property
+  // intialize our properties
   {
     // try to get our uuid, if we can get it, we set the property and property
     // callback
@@ -109,8 +113,12 @@ JackTransportLink::JackTransportLink(jack_client_t *client,
       setBPMProperty(mBPM.load(std::memory_order_acquire));
       setEnableStartStopProperty(mLink.isStartStopSyncEnabled());
       setSyncProperty(mSyncLink);
+      setNumPeersProperty(mLink.numPeers());
       jack_set_property_change_callback(
           mJackClient, JackTransportLink::propertyChangeCallback, this);
+    } else {
+      std::cerr << "cannot get client uuid, property based settings won't work"
+                << std::endl;
     }
     if (uuids) {
       jack_free(uuids);
@@ -598,6 +606,14 @@ void JackTransportLink::setSyncProperty(bool sync) {
     std::string s = sync ? "true" : "false";
     jack_set_property(mJackClient, mJackClientUUID, linksync_key.c_str(),
                       s.c_str(), bool_type);
+  }
+}
+
+void JackTransportLink::setNumPeersProperty(size_t peers) {
+  if (!jack_uuid_empty(mJackClientUUID)) {
+    std::string s = std::to_string(peers);
+    jack_set_property(mJackClient, mJackClientUUID, numpeers_key.c_str(),
+                      s.c_str(), int_type);
   }
 }
 
