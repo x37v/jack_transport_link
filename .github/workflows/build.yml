@@ -1,0 +1,79 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-rpi64:
+    runs-on: ubuntu-latest
+    container: xnor/rnbo-runner-xpile:0.1
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Build rpi64
+        run: |
+          mkdir -p build-rpi64
+          cd build-rpi64
+          cmake \
+            -DCMAKE_TOOLCHAIN_FILE=/home/build/cmake/toolchains/aarch64-unknown-linux-gcc11_4.cmake \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCPACK_DEBIAN_PACKAGE_ARCHITECTURE=arm64 \
+            .. && make -j$(nproc) && cpack
+      - name: Upload deb
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build-rpi64/*.deb
+
+  build-rpi32:
+    runs-on: ubuntu-latest
+    container: xnor/rnbo-runner-xpile:0.1
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Build rpi32
+        run: |
+          mkdir -p build-rpi32
+          cd build-rpi32
+          cmake \
+            -DCMAKE_TOOLCHAIN_FILE=/home/build/cmake/toolchains/armv7-unknown-linux-gnueabihf-gcc11_4.cmake \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCPACK_DEBIAN_PACKAGE_ARCHITECTURE=armhf \
+            .. && make -j$(nproc) && cpack
+      - name: Upload deb
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build-rpi32/*.deb
+
+  build-move:
+    runs-on: ubuntu-latest
+    container: xnor/rnbo-runner-xpile:0.1
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Build move
+        run: |
+          mkdir -p build-move
+          cd build-move
+          cmake \
+            -DCMAKE_TOOLCHAIN_FILE=/home/build/cmake/toolchains/aarch64-unknown-linux-gcc11_4.cmake \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCPACK_DEBIAN_PACKAGE_ARCHITECTURE=arm64 \
+            -DCMAKE_BUILD_RPATH=/data/UserData/rnbo/lib/ \
+            .. && make -j$(nproc)
+      - name: Rename executable
+        run: cp build-move/jack_transport_link build-move/jack_transport_link-move
+      - name: Upload executable
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build-move/jack_transport_link-move
