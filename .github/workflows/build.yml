@@ -8,7 +8,9 @@ on:
 jobs:
   build-rpi64:
     runs-on: ubuntu-latest
-    container: xnor/rnbo-runner-xpile:0.1
+    container:
+      image: xnor/rnbo-runner-xpile:0.1
+      options: --user root
     permissions:
       contents: write
     steps:
@@ -31,7 +33,9 @@ jobs:
 
   build-rpi32:
     runs-on: ubuntu-latest
-    container: xnor/rnbo-runner-xpile:0.1
+    container:
+      image: xnor/rnbo-runner-xpile:0.1
+      options: --user root
     permissions:
       contents: write
     steps:
@@ -54,7 +58,9 @@ jobs:
 
   build-move:
     runs-on: ubuntu-latest
-    container: xnor/rnbo-runner-xpile:0.1
+    container:
+      image: xnor/rnbo-runner-xpile:0.1
+      options: --user root
     permissions:
       contents: write
     steps:
