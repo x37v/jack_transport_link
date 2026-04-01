@@ -6,6 +6,25 @@ on:
       - 'v*'
 
 jobs:
+  source-bundle:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Create source archive
+        run: |
+          tar \
+            --exclude='.git' \
+            --exclude='.github' \
+            -czf ../jack_transport_link-${{ github.ref_name }}-source-with-submodules.tar.gz .
+      - name: Upload source archive
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ../jack_transport_link-${{ github.ref_name }}-source-with-submodules.tar.gz
+
   build-rpi64:
     runs-on: ubuntu-latest
     container:
