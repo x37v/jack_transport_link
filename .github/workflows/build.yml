@@ -19,11 +19,12 @@ jobs:
           tar \
             --exclude='.git' \
             --exclude='.github' \
-            -czf ../jack_transport_link-${{ github.ref_name }}-source-with-submodules.tar.gz .
+            --transform 's|^\.|jack_transport_link-${{ github.ref_name }}|' \
+            -czf ../jack_transport_link-${{ github.ref_name }}-src.tar.gz .
       - name: Upload source archive
         uses: softprops/action-gh-release@v2
         with:
-          files: ../jack_transport_link-${{ github.ref_name }}-source-with-submodules.tar.gz
+          files: ../jack_transport_link-${{ github.ref_name }}-src.tar.gz
 
   build-rpi64:
     runs-on: ubuntu-latest
