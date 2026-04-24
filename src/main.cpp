@@ -100,6 +100,24 @@ int main(int argc, char *argv[]) {
       .dest("oscport")
       .set_default("-1");
 
+  parser.add_option("-A", "--no-link-audio")
+      .action("store_false")
+      .dest("link_audio")
+      .set_default("1")
+      .help("Disable Link Audio (network audio streaming). Enabled by default.");
+
+  parser.add_option("--link-audio-in-channels")
+      .type("int")
+      .dest("link_audio_in_channels")
+      .set_default("2")
+      .help("Number of Link Audio send (input) channels, default: %default.");
+
+  parser.add_option("--link-audio-out-channels")
+      .type("int")
+      .dest("link_audio_out_channels")
+      .set_default("2")
+      .help("Number of Link Audio receive (output) channels, default: %default.");
+
   // process args
   optparse::Values options = parser.parse_args(argc, argv);
   std::vector<std::string> args = parser.args();
@@ -122,6 +140,9 @@ int main(int argc, char *argv[]) {
   double initialTicksPerBeat = options.get("ticks");
   std::string name = options["name"];
   int oscport = options.get("oscport");
+  bool enableLinkAudio = static_cast<bool>(options.get("link_audio"));
+  size_t linkAudioInChannels = static_cast<size_t>(static_cast<int>(options.get("link_audio_in_channels")));
+  size_t linkAudioOutChannels = static_cast<size_t>(static_cast<int>(options.get("link_audio_out_channels")));
 
   if (initialBPM <= 0.0 || initialQuantum < 1.0 || initialTimeSigDenom < 1.0 ||
       initialTicksPerBeat < 1.0) {
@@ -138,7 +159,9 @@ int main(int argc, char *argv[]) {
       jack_on_shutdown(client, shutdown_handler, nullptr);
       JackTransportLink j(client, enableStartStopSync, initialBPM,
                           initialQuantum, initialTimeSigDenom,
-                          initialTicksPerBeat);
+                          initialTicksPerBeat,
+                          enableLinkAudio, linkAudioInChannels,
+                          linkAudioOutChannels);
 
       if (oscport > 0) {
         try {

@@ -71,11 +71,20 @@ JackTransportLink::JackTransportLink(jack_client_t *client,
                                      bool enableStartStopSync,
                                      double initialBPM, double initialQuantum,
                                      float initialTimeSigDenom,
-                                     double initialTicksPerBeat)
-    : mJackClient(client), mBPM(initialBPM), mQuantum(initialQuantum),
+                                     double initialTicksPerBeat,
+                                     bool enableLinkAudio,
+                                     size_t linkAudioInChannels,
+                                     size_t linkAudioOutChannels)
+    : mJackClient(client),
+      mSampleRate(static_cast<double>(jack_get_sample_rate(client))),
+      mLinkAudioInChannels(linkAudioInChannels),
+      mLinkAudioOutChannels(linkAudioOutChannels),
+      mBPM(initialBPM), mQuantum(initialQuantum),
       mInitialQuantum(initialQuantum),
       mInitialTimeSigDenom(initialTimeSigDenom),
-      mInitialTicksPerBeat(initialTicksPerBeat), mLink(initialBPM),
+      mInitialTicksPerBeat(initialTicksPerBeat),
+      mLink(initialBPM, jack_get_client_name(client)),
+      mLinkAudioRenderer(mLink, linkAudioInChannels, linkAudioOutChannels, mSampleRate),
       mJackClientUUID(0) {
   // setup listener
 
@@ -136,6 +145,40 @@ JackTransportLink::JackTransportLink(jack_client_t *client,
                          JackPortFlags::JackPortIsOutput, 0);
 #endif
 
+  mLinkAudioEnabled = enableLinkAudio;
+  if (mLinkAudioEnabled) {
+    jack_nframes_t bufSize = jack_get_buffer_size(mJackClient);
+    mAudioSendBuf.resize(bufSize * mLinkAudioInChannels);
+    mAudioRecvBuf.resize(bufSize * mLinkAudioOutChannels);
+    mSendPtrs.resize(mLinkAudioInChannels);
+    mRecvPtrs.resize(mLinkAudioOutChannels);
+    for (size_t ch = 0; ch < mLinkAudioInChannels; ++ch)
+      mSendPtrs[ch] = mAudioSendBuf.data() + ch * bufSize;
+    for (size_t ch = 0; ch < mLinkAudioOutChannels; ++ch)
+      mRecvPtrs[ch] = mAudioRecvBuf.data() + ch * bufSize;
+
+    jack_set_buffer_size_callback(mJackClient,
+                                  JackTransportLink::bufferSizeCallback, this);
+
+    mAudioIns.resize(mLinkAudioInChannels);
+    mAudioOuts.resize(mLinkAudioOutChannels);
+    for (size_t ch = 0; ch < mLinkAudioInChannels; ++ch) {
+      auto name_in = "in_" + std::to_string(ch + 1);
+      mAudioIns[ch] = jack_port_register(mJackClient, name_in.c_str(),
+          JACK_DEFAULT_AUDIO_TYPE, JackPortIsInput | JackPortIsTerminal, 0);
+    }
+    for (size_t ch = 0; ch < mLinkAudioOutChannels; ++ch) {
+      auto name_out = "out_" + std::to_string(ch + 1);
+      mAudioOuts[ch] = jack_port_register(mJackClient, name_out.c_str(),
+          JACK_DEFAULT_AUDIO_TYPE, JackPortIsOutput | JackPortIsTerminal, 0);
+    }
+
+    mLink.enableLinkAudio(true);
+    mLink.setChannelsChangedCallback([this]() {
+      mChannelsChanged.store(true, std::memory_order_release);
+    });
+  }
+
   // setup jack, become the timebase master, unconditionally
   jack_set_process_callback(mJackClient, JackTransportLink::processCallback,
                             this);
@@ -152,7 +195,30 @@ JackTransportLink::~JackTransportLink() {
   jack_client_close(mJackClient);
 }
 
+int JackTransportLink::bufferSizeCallback(jack_nframes_t nframes, void *arg) {
+  return static_cast<JackTransportLink *>(arg)->bufferSizeCallback(nframes);
+}
+
+int JackTransportLink::bufferSizeCallback(jack_nframes_t nframes) {
+  mAudioSendBuf.resize(nframes * mLinkAudioInChannels);
+  mAudioRecvBuf.resize(nframes * mLinkAudioOutChannels);
+  for (size_t ch = 0; ch < mLinkAudioInChannels; ++ch)
+    mSendPtrs[ch] = mAudioSendBuf.data() + ch * nframes;
+  for (size_t ch = 0; ch < mLinkAudioOutChannels; ++ch)
+    mRecvPtrs[ch] = mAudioRecvBuf.data() + ch * nframes;
+  return 0;
+}
+
 void JackTransportLink::processEvents() {
+  if (mLinkAudioEnabled && mChannelsChanged.load(std::memory_order_acquire)) {
+    mChannelsChanged.store(false, std::memory_order_release);
+    auto channels = mLink.channels();
+    if (!mLinkAudioRenderer.hasSource() && !channels.empty()) {
+      mLinkAudioRenderer.createSource(channels[0].id);
+    } else if (mLinkAudioRenderer.hasSource() && channels.empty()) {
+      mLinkAudioRenderer.removeSource();
+    }
+  }
   if (mReportBPM) {
     mReportBPM = false;
     setBPMProperty(mBPM.load(std::memory_order_acquire));
@@ -437,6 +503,27 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
     }
   }
 #endif
+
+  if (mLinkAudioEnabled && !mAudioIns.empty()) {
+    for (size_t ch = 0; ch < mLinkAudioInChannels; ++ch) {
+      auto *inBuf = static_cast<float *>(
+          jack_port_get_buffer(mAudioIns[ch], nframes));
+      for (jack_nframes_t i = 0; i < nframes; ++i)
+        mSendPtrs[ch][i] = static_cast<double>(inBuf[i]);
+    }
+
+    auto sessionState = mLink.captureAudioSessionState();
+    mLinkAudioRenderer(mSendPtrs.data(), mRecvPtrs.data(),
+                       nframes, sessionState, mSampleRate,
+                       mTimeNext, mQuantum);
+
+    for (size_t ch = 0; ch < mLinkAudioOutChannels; ++ch) {
+      auto *outBuf = static_cast<float *>(
+          jack_port_get_buffer(mAudioOuts[ch], nframes));
+      for (jack_nframes_t i = 0; i < nframes; ++i)
+        outBuf[i] = static_cast<float>(mRecvPtrs[ch][i]);
+    }
+  }
 
   return 0;
 }
