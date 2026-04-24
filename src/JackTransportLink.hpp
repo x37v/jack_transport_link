@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -20,6 +21,9 @@
 
 class JackTransportLink : public oscpack::OscPacketListener {
 public:
+  using SinkRenderer = ableton::linkaudio::LinkAudioSinkRenderer<ableton::LinkAudio>;
+  using SourceRenderer = ableton::linkaudio::LinkAudioSourceRenderer<ableton::LinkAudio>;
+
   enum class MIDIClockRunState { Running, Stopped, NeedsSync };
 
   JackTransportLink(jack_client_t *client,
@@ -29,8 +33,8 @@ public:
                     float initialTimeSigDenom = 4.,
                     double initialTicksPerBeat = 1920.,
                     bool enableLinkAudio = true,
-                    size_t linkAudioInChannels = 2,
-                    size_t linkAudioOutChannels = 2);
+                    size_t linkAudioStereoInChannels = 1,
+                    size_t linkAudioStereoOutChannels = 1);
   ~JackTransportLink();
 
   void processEvents();
@@ -63,18 +67,19 @@ private:
   void setNumPeersProperty(size_t peers);
   void setLinkAudioChannelsProperty(const std::vector<ableton::LinkAudio::Channel>& channels);
   void setLinkAudioSourceProperty();
-  void updateLinkAudioSource();
+  bool updateLinkAudioSource();
 
   void invalidateClockSyncBBT();
 
   jack_client_t *mJackClient;
 
-  // mSampleRate, channel counts, and mLink must be declared before mLinkAudioRenderer
+  // mSampleRate must precede mRenderers
   double mSampleRate;
-  size_t mLinkAudioInChannels;
-  size_t mLinkAudioOutChannels;
+  size_t mNumStereoInChannels;
+  size_t mNumStereoOutChannels;
   ableton::LinkAudio mLink;
-  ableton::linkaudio::LinkAudioRenderer<ableton::LinkAudio> mLinkAudioRenderer;
+  std::vector<std::unique_ptr<SinkRenderer>> mSendRenderers;    // one per stereo in pair
+  std::vector<std::unique_ptr<SourceRenderer>> mRecvRenderers;  // one per stereo out pair
 
   jack_port_t *mMIDIClockOut = nullptr;
   MIDIClockRunState mMIDIClockRunState = MIDIClockRunState::Stopped;
@@ -111,22 +116,24 @@ private:
   bool mReportLinkSync = false;
   bool mReportStartStopEnable = false;
 
-  std::vector<double> mAudioSendBuf;
-  std::vector<double> mAudioRecvBuf;
-  std::vector<double*> mSendPtrs;
-  std::vector<double*> mRecvPtrs;
+  // mStereoSendBuf: mNumStereoInChannels * 2 * nframes
+  // mStereoRecvBuf: mNumStereoOutChannels * 2 * nframes
+  std::vector<double> mStereoSendBuf;
+  std::vector<double> mStereoRecvBuf;
 
-  std::vector<jack_port_t*> mAudioIns;
-  std::vector<jack_port_t*> mAudioOuts;
+  std::vector<jack_port_t*> mAudioIns;  // 2 * mNumStereoInChannels ports
+  std::vector<jack_port_t*> mAudioOuts; // 2 * mNumStereoOutChannels ports
   std::atomic<bool> mChannelsChanged{false};
   bool mLinkAudioEnabled = false;
 
-  // Link Audio source selection — filters written from property/OSC callbacks, read in processEvents
-  std::string mLinkAudioPeerFilter;    // empty = any peer (auto)
-  std::string mLinkAudioChannelFilter; // empty = any channel
-  std::optional<ableton::ChannelId> mCurrentSourceChannelId;
-  std::string mCurrentSourcePeerName;
-  std::string mCurrentSourceChannelName;
+  // Per-receiver source filters — written from property/OSC callbacks, read in processEvents.
+  // An object sets index 0; an array sets each index by position. Empty string = any (auto).
+  std::vector<std::string> mLinkAudioPeerFilters;
+  std::vector<std::string> mLinkAudioChannelFilters;
+  // Per-renderer connection state
+  std::vector<std::optional<ableton::ChannelId>> mCurrentSourceChannelIds;
+  std::vector<std::string> mCurrentSourcePeerNames;
+  std::vector<std::string> mCurrentSourceChannelNames;
   std::atomic<bool> mNeedsSourceUpdate{false};
   bool mReportLinkAudioChannels = false;
   bool mReportLinkAudioSource = false;

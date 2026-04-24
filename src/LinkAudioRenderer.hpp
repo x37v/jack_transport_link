@@ -39,35 +39,18 @@ T linearInterpolate(T value, T inMin, T inMax, T outMin, T outMax)
 } // namespace
 
 template <typename Link>
-class LinkAudioRenderer
+class LinkAudioSinkRenderer
 {
-  struct Buffer
-  {
-    std::vector<double> mSamples; // pre-sized; covers max network buffer * max channels
-    LinkAudioSource::BufferHandle::Info mInfo;
-  };
-  using Queue = link_audio::Queue<Buffer>;
-
 public:
-  LinkAudioRenderer(Link& link,
-                    size_t numInChannels,
-                    size_t numOutChannels,
-                    double& sampleRate)
+  LinkAudioSinkRenderer(Link& link,
+                        std::string name,
+                        size_t numChannels,
+                        double& sampleRate)
     : mLink(link)
-    , mNumInChannels(numInChannels)
-    , mNumOutChannels(numOutChannels)
-    , mSink(mLink, "Link Audio", 4096 * numInChannels)
+    , mNumChannels(numChannels)
+    , mSink(mLink, std::move(name), 4096 * numChannels)
     , mSampleRate(sampleRate)
-    , mReceiverSampleCaches(numOutChannels, {0.0, 0.0, 0.0, 0.0})
-  {
-    Buffer proto;
-    proto.mSamples.resize(1024 * 8); // generous: 1024 frames * 8 channels
-    auto queue = Queue(2048, proto);
-    mpQueueWriter = std::make_shared<typename Queue::Writer>(std::move(queue.writer()));
-    mpQueueReader = std::make_shared<typename Queue::Reader>(std::move(queue.reader()));
-  }
-
-  ~LinkAudioRenderer() { mpSource.reset(); }
+  {}
 
   void send(double* const* ppChannels,
             size_t numFrames,
@@ -80,8 +63,8 @@ public:
     if (buffer)
     {
       for (size_t frame = 0; frame < numFrames; ++frame)
-        for (size_t ch = 0; ch < mNumInChannels; ++ch)
-          buffer.samples[frame * mNumInChannels + ch] =
+        for (size_t ch = 0; ch < mNumChannels; ++ch)
+          buffer.samples[frame * mNumChannels + ch] =
               ableton::util::floatToInt16(ppChannels[ch][frame]);
 
       const auto beatsAtBufferBegin = sessionState.beatAtTime(hostTime, quantum);
@@ -89,10 +72,45 @@ public:
                     beatsAtBufferBegin,
                     quantum,
                     numFrames,
-                    mNumInChannels,
+                    mNumChannels,
                     static_cast<uint32_t>(sampleRate));
     }
   }
+
+private:
+  Link& mLink;
+  size_t mNumChannels;
+  LinkAudioSink mSink;
+  double& mSampleRate;
+};
+
+template <typename Link>
+class LinkAudioSourceRenderer
+{
+  struct Buffer
+  {
+    std::vector<double> mSamples;
+    LinkAudioSource::BufferHandle::Info mInfo;
+  };
+  using Queue = link_audio::Queue<Buffer>;
+
+public:
+  LinkAudioSourceRenderer(Link& link,
+                          size_t numChannels,
+                          double& sampleRate)
+    : mLink(link)
+    , mNumChannels(numChannels)
+    , mSampleRate(sampleRate)
+    , mReceiverSampleCaches(numChannels, {0.0, 0.0, 0.0, 0.0})
+  {
+    Buffer proto;
+    proto.mSamples.resize(1024 * 8);
+    auto queue = Queue(2048, proto);
+    mpQueueWriter = std::make_shared<typename Queue::Writer>(std::move(queue.writer()));
+    mpQueueReader = std::make_shared<typename Queue::Reader>(std::move(queue.reader()));
+  }
+
+  ~LinkAudioSourceRenderer() { mpSource.reset(); }
 
   void receive(double* const* ppChannels,
                size_t numFrames,
@@ -102,7 +120,7 @@ public:
                double quantum)
   {
     auto silenceOutputs = [&]() {
-      for (size_t ch = 0; ch < mNumOutChannels; ++ch)
+      for (size_t ch = 0; ch < mNumChannels; ++ch)
         std::fill_n(ppChannels[ch], numFrames, 0.0);
     };
 
@@ -239,10 +257,9 @@ public:
       const auto frameIdx = static_cast<size_t>(std::floor(framePos));
       const auto t = framePos - std::floor(framePos);
 
-      // Advance all per-channel caches together until moLastFrameIdx reaches frameIdx
       while (!moLastFrameIdx || (moLastFrameIdx && frameIdx > *moLastFrameIdx))
       {
-        for (size_t ch = 0; ch < mNumOutChannels; ++ch)
+        for (size_t ch = 0; ch < mNumChannels; ++ch)
         {
           auto& cache = mReceiverSampleCaches[ch];
           cache[3] = cache[2];
@@ -255,7 +272,7 @@ public:
         moLastFrameIdx = moLastFrameIdx ? (*moLastFrameIdx + 1) : frameIdx;
       }
 
-      for (size_t ch = 0; ch < mNumOutChannels; ++ch)
+      for (size_t ch = 0; ch < mNumChannels; ++ch)
       {
         ppChannels[ch][frame] = (ch < srcChannels)
             ? cubicInterpolate(mReceiverSampleCaches[ch], t)
@@ -281,18 +298,6 @@ public:
       buffered += float(info.numFrames) / float(info.sampleRate);
     }
     mBuffered = buffered;
-  }
-
-  void operator()(double* const* ppSendChannels,
-                  double* const* ppRecvChannels,
-                  size_t numFrames,
-                  typename Link::SessionState sessionState,
-                  double sampleRate,
-                  const std::chrono::microseconds hostTime,
-                  double quantum)
-  {
-    send(ppSendChannels, numFrames, sessionState, sampleRate, hostTime, quantum);
-    receive(ppRecvChannels, numFrames, sessionState, sampleRate, hostTime, quantum);
   }
 
   bool hasSource() const { return mpSource != nullptr; }
@@ -343,17 +348,15 @@ public:
     }
   }
 
+private:
   Link& mLink;
-  size_t mNumInChannels;
-  size_t mNumOutChannels;
-  LinkAudioSink mSink;
+  size_t mNumChannels;
   std::unique_ptr<LinkAudioSource> mpSource;
   double& mSampleRate;
 
   std::optional<double> moStartReadPos;
   std::atomic<float> mBuffered = 0;
 
-private:
   std::shared_ptr<typename Queue::Writer> mpQueueWriter;
   std::shared_ptr<typename Queue::Reader> mpQueueReader;
 
@@ -372,18 +375,31 @@ namespace linkaudio
 {
 
 template <typename Link>
-class LinkAudioRenderer
+class LinkAudioSinkRenderer
 {
 public:
-  LinkAudioRenderer(Link&, size_t, size_t, double&) {}
+  LinkAudioSinkRenderer(Link&, std::string, size_t, double&) {}
 
-  void operator()(double* const*,
-                  double* const*,
-                  size_t numFrames,
-                  typename Link::SessionState,
-                  double,
-                  const std::chrono::microseconds,
-                  double) {}
+  void send(double* const*,
+            size_t,
+            typename Link::SessionState,
+            double,
+            const std::chrono::microseconds,
+            double) {}
+};
+
+template <typename Link>
+class LinkAudioSourceRenderer
+{
+public:
+  LinkAudioSourceRenderer(Link&, size_t, double&) {}
+
+  void receive(double* const*,
+               size_t numFrames,
+               typename Link::SessionState,
+               double,
+               const std::chrono::microseconds,
+               double) {}
 
   bool hasSource() const { return false; }
   template <typename ChannelId>

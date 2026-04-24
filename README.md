@@ -87,42 +87,53 @@ Pass `-o <port>` to enable the OSC listener. All messages are sent to that UDP p
 | `/jacklink/beattime` | `float` or `double` | Seek the transport to the given beat position. |
 | `/jacklink/sync` | `bool` | Enable (`true`) or disable (`false`) Link sync. |
 | `/jacklink/rolling` | `bool` | Start (`true`) or stop (`false`) the transport. |
-| `/jacklink/linkaudio/source` | `string` (JSON) | Select the Link Audio source. See [Link Audio](#link-audio) below. |
+| `/jacklink/linkaudio/source` | `string` (JSON) | Set source filter for all receivers (object or array). See [Link Audio](#link-audio). |
+| `/jacklink/linkaudio/source/<N>` | `string` (JSON object) | Set source filter for receiver N (zero-based). |
 
 ## Link Audio
 
 Link Audio streams real-time audio between peers in a Link session with beat-grid alignment. It is enabled by default (disable with `--no-link-audio`).
 
-JACK ports `in_1`/`in_2` (configurable with `--link-audio-in-channels`) capture audio and send it to peers. JACK ports `out_1`/`out_2` (configurable with `--link-audio-out-channels`) play back audio received from a peer.
+Each stereo send pair (configurable with `--link-audio-in-stereo-channels`, default `1`) registers JACK input ports `in_1`/`in_2`, `in_3`/`in_4`, etc. and announces a named stereo channel ("Send 1", "Send 2", …) to the Link session.
+
+Each stereo receive pair (configurable with `--link-audio-out-stereo-channels`, default `1`) registers JACK output ports `out_1`/`out_2`, `out_3`/`out_4`, etc. and subscribes to one incoming channel ("Recv 1", "Recv 2", …). Send and receive counts are independent.
 
 ### Selecting a source
 
 By default the first available peer is subscribed automatically. To select a specific peer, set the `linkaudio/source` Jack metadata property or send an OSC message to `/jacklink/linkaudio/source`.
 
-The value is a JSON object:
+The value is either a **single JSON object** (sets receiver 0 only) or a **JSON array** (sets each receiver by index). Each element is a `{"peer":"…","channel":"…"}` filter — both fields are case-insensitive substring matches and either can be omitted. `{}` reverts that receiver to auto-selection.
 
-```json
-{"peer": "Alex's MacBook", "channel": "Link Audio"}
-```
-
-Both fields are case-insensitive substring filters — either can be omitted to match anything. To revert to auto-selection, pass an empty object `{}`.
-
-The property always reflects the current connection state: it shows the actual peer and channel name when connected, or `{}` when no source is active.
+The property always reflects the current connection state as a JSON array, one entry per receive pair — `{}` for any receiver with no active source.
 
 ```shell
-# Select a source by peer name substring
+# Set receiver 0 only (indexed property — single object)
 jack_property --client jack-transport-link \
-  http://www.x37v.info/jack/metadata/linkaudio/source \
+  http://www.x37v.info/jack/metadata/linkaudio/source/0 \
   '{"peer":"Push"}' application/json
 
-# Revert to auto
+# Set receiver 1 only
+jack_property --client jack-transport-link \
+  http://www.x37v.info/jack/metadata/linkaudio/source/1 \
+  '{"peer":"Alex","channel":"Cue"}' application/json
+
+# Set all receivers at once (array form on the base property)
 jack_property --client jack-transport-link \
   http://www.x37v.info/jack/metadata/linkaudio/source \
+  '[{"peer":"Push"},{"peer":"Alex"}]' application/json
+
+# Revert receiver 0 to auto (others unchanged)
+jack_property --client jack-transport-link \
+  http://www.x37v.info/jack/metadata/linkaudio/source/0 \
   '{}' application/json
 
-# Read the current source
+# Read all current connections (array, one entry per receiver)
 jack_property --client jack-transport-link --list \
   http://www.x37v.info/jack/metadata/linkaudio/source
+
+# Read the current connection for receiver 0
+jack_property --client jack-transport-link --list \
+  http://www.x37v.info/jack/metadata/linkaudio/source/0
 
 # List available channels
 jack_property --client jack-transport-link --list \

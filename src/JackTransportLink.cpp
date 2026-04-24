@@ -72,19 +72,47 @@ GetOscDouble(const oscpack::ReceivedMessageArgument &arg) {
   return std::nullopt;
 }
 
-// Parse {"peer":"...","channel":"..."} into filter strings.
-// An empty object {} clears both filters (auto-select). Returns false on parse error.
-bool parseLinkAudioSourceFilter(const std::string& s,
-                                std::string& peerOut,
-                                std::string& channelOut) {
+// Parse a source filter value into per-receiver peer/channel filter vectors.
+// Accepts a single object (sets index 0 only) or an array (sets each index by position).
+// {} / [] clears the affected filters, reverting to auto-select.
+// Returns false on parse error; leaves vectors unchanged on error.
+bool parseLinkAudioSourceFilters(const std::string& s,
+                                 std::vector<std::string>& peersOut,
+                                 std::vector<std::string>& channelsOut) {
   try {
     auto j = nlohmann::json::parse(s);
-    peerOut    = j.value("peer",    "");
-    channelOut = j.value("channel", "");
-    return true;
+    if (j.is_object()) {
+      if (!peersOut.empty()) {
+        peersOut[0]    = j.value("peer",    "");
+        channelsOut[0] = j.value("channel", "");
+      }
+      return true;
+    } else if (j.is_array()) {
+      const size_t n = std::min(j.size(), peersOut.size());
+      for (size_t i = 0; i < n; ++i) {
+        peersOut[i]    = j[i].value("peer",    "");
+        channelsOut[i] = j[i].value("channel", "");
+      }
+      return true;
+    }
+    return false;
   } catch (...) {
     return false;
   }
+}
+
+// Returns the receiver index from a key of the form linkaudio_source_key + "/<N>", else -1.
+int linkAudioSourceIndex(const char* key) {
+  if (!key) return -1;
+  const size_t plen = linkaudio_source_key.size();
+  if (std::strncmp(key, linkaudio_source_key.c_str(), plen) != 0) return -1;
+  if (key[plen] != '/') return -1;
+  const char* idxStr = key + plen + 1;
+  if (!*idxStr) return -1;
+  char* end;
+  long idx = std::strtol(idxStr, &end, 10);
+  if (*end != '\0' || idx < 0) return -1;
+  return static_cast<int>(idx);
 }
 
 } // namespace
@@ -95,18 +123,17 @@ JackTransportLink::JackTransportLink(jack_client_t *client,
                                      float initialTimeSigDenom,
                                      double initialTicksPerBeat,
                                      bool enableLinkAudio,
-                                     size_t linkAudioInChannels,
-                                     size_t linkAudioOutChannels)
+                                     size_t linkAudioStereoInChannels,
+                                     size_t linkAudioStereoOutChannels)
     : mJackClient(client),
       mSampleRate(static_cast<double>(jack_get_sample_rate(client))),
-      mLinkAudioInChannels(linkAudioInChannels),
-      mLinkAudioOutChannels(linkAudioOutChannels),
+      mNumStereoInChannels(linkAudioStereoInChannels),
+      mNumStereoOutChannels(linkAudioStereoOutChannels),
       mBPM(initialBPM), mQuantum(initialQuantum),
       mInitialQuantum(initialQuantum),
       mInitialTimeSigDenom(initialTimeSigDenom),
       mInitialTicksPerBeat(initialTicksPerBeat),
       mLink(initialBPM, jack_get_client_name(client)),
-      mLinkAudioRenderer(mLink, linkAudioInChannels, linkAudioOutChannels, mSampleRate),
       mJackClientUUID(0) {
   // setup listener
 
@@ -168,34 +195,43 @@ JackTransportLink::JackTransportLink(jack_client_t *client,
 #endif
 
   mLinkAudioEnabled = enableLinkAudio;
-  if (mLinkAudioEnabled && !jack_uuid_empty(mJackClientUUID)) {
-    setLinkAudioSourceProperty();
-    setLinkAudioChannelsProperty({});
-  }
   if (mLinkAudioEnabled) {
+    for (size_t i = 0; i < mNumStereoInChannels; ++i)
+      mSendRenderers.push_back(std::make_unique<SinkRenderer>(
+          mLink, "Send " + std::to_string(i + 1), 2, mSampleRate));
+    for (size_t i = 0; i < mNumStereoOutChannels; ++i)
+      mRecvRenderers.push_back(std::make_unique<SourceRenderer>(
+          mLink, 2, mSampleRate));
+
+    mCurrentSourceChannelIds.resize(mNumStereoOutChannels);
+    mCurrentSourcePeerNames.resize(mNumStereoOutChannels);
+    mCurrentSourceChannelNames.resize(mNumStereoOutChannels);
+    mLinkAudioPeerFilters.resize(mNumStereoOutChannels);
+    mLinkAudioChannelFilters.resize(mNumStereoOutChannels);
+
     jack_nframes_t bufSize = jack_get_buffer_size(mJackClient);
-    mAudioSendBuf.resize(bufSize * mLinkAudioInChannels);
-    mAudioRecvBuf.resize(bufSize * mLinkAudioOutChannels);
-    mSendPtrs.resize(mLinkAudioInChannels);
-    mRecvPtrs.resize(mLinkAudioOutChannels);
-    for (size_t ch = 0; ch < mLinkAudioInChannels; ++ch)
-      mSendPtrs[ch] = mAudioSendBuf.data() + ch * bufSize;
-    for (size_t ch = 0; ch < mLinkAudioOutChannels; ++ch)
-      mRecvPtrs[ch] = mAudioRecvBuf.data() + ch * bufSize;
+    mStereoSendBuf.resize(mNumStereoInChannels * 2 * bufSize);
+    mStereoRecvBuf.resize(mNumStereoOutChannels * 2 * bufSize);
 
     jack_set_buffer_size_callback(mJackClient,
                                   JackTransportLink::bufferSizeCallback, this);
 
-    mAudioIns.resize(mLinkAudioInChannels);
-    mAudioOuts.resize(mLinkAudioOutChannels);
-    for (size_t ch = 0; ch < mLinkAudioInChannels; ++ch) {
-      auto name_in = "in_" + std::to_string(ch + 1);
-      mAudioIns[ch] = jack_port_register(mJackClient, name_in.c_str(),
+    mAudioIns.resize(2 * mNumStereoInChannels);
+    mAudioOuts.resize(2 * mNumStereoOutChannels);
+    for (size_t i = 0; i < mNumStereoInChannels; ++i) {
+      mAudioIns[i * 2]     = jack_port_register(mJackClient,
+          ("in_" + std::to_string(i * 2 + 1)).c_str(),
+          JACK_DEFAULT_AUDIO_TYPE, JackPortIsInput | JackPortIsTerminal, 0);
+      mAudioIns[i * 2 + 1] = jack_port_register(mJackClient,
+          ("in_" + std::to_string(i * 2 + 2)).c_str(),
           JACK_DEFAULT_AUDIO_TYPE, JackPortIsInput | JackPortIsTerminal, 0);
     }
-    for (size_t ch = 0; ch < mLinkAudioOutChannels; ++ch) {
-      auto name_out = "out_" + std::to_string(ch + 1);
-      mAudioOuts[ch] = jack_port_register(mJackClient, name_out.c_str(),
+    for (size_t i = 0; i < mNumStereoOutChannels; ++i) {
+      mAudioOuts[i * 2]     = jack_port_register(mJackClient,
+          ("out_" + std::to_string(i * 2 + 1)).c_str(),
+          JACK_DEFAULT_AUDIO_TYPE, JackPortIsOutput | JackPortIsTerminal, 0);
+      mAudioOuts[i * 2 + 1] = jack_port_register(mJackClient,
+          ("out_" + std::to_string(i * 2 + 2)).c_str(),
           JACK_DEFAULT_AUDIO_TYPE, JackPortIsOutput | JackPortIsTerminal, 0);
     }
 
@@ -203,6 +239,10 @@ JackTransportLink::JackTransportLink(jack_client_t *client,
     mLink.setChannelsChangedCallback([this]() {
       mChannelsChanged.store(true, std::memory_order_release);
     });
+  }
+  if (mLinkAudioEnabled && !jack_uuid_empty(mJackClientUUID)) {
+    setLinkAudioSourceProperty();
+    setLinkAudioChannelsProperty({});
   }
 
   // setup jack, become the timebase master, unconditionally
@@ -226,12 +266,8 @@ int JackTransportLink::bufferSizeCallback(jack_nframes_t nframes, void *arg) {
 }
 
 int JackTransportLink::bufferSizeCallback(jack_nframes_t nframes) {
-  mAudioSendBuf.resize(nframes * mLinkAudioInChannels);
-  mAudioRecvBuf.resize(nframes * mLinkAudioOutChannels);
-  for (size_t ch = 0; ch < mLinkAudioInChannels; ++ch)
-    mSendPtrs[ch] = mAudioSendBuf.data() + ch * nframes;
-  for (size_t ch = 0; ch < mLinkAudioOutChannels; ++ch)
-    mRecvPtrs[ch] = mAudioRecvBuf.data() + ch * nframes;
+  mStereoSendBuf.resize(mNumStereoInChannels * 2 * nframes);
+  mStereoRecvBuf.resize(mNumStereoOutChannels * 2 * nframes);
   return 0;
 }
 
@@ -239,14 +275,12 @@ void JackTransportLink::processEvents() {
   if (mLinkAudioEnabled) {
     if (mChannelsChanged.load(std::memory_order_acquire)) {
       mChannelsChanged.store(false, std::memory_order_release);
-      updateLinkAudioSource();
-      mReportLinkAudioChannels  = true;
-      mReportLinkAudioSource = true;
+      if (updateLinkAudioSource()) mReportLinkAudioSource = true;
+      mReportLinkAudioChannels = true;
     }
     if (mNeedsSourceUpdate.load(std::memory_order_acquire)) {
       mNeedsSourceUpdate.store(false, std::memory_order_release);
-      updateLinkAudioSource();
-      mReportLinkAudioSource = true;
+      if (updateLinkAudioSource()) mReportLinkAudioSource = true;
     }
     if (mReportLinkAudioChannels) {
       mReportLinkAudioChannels = false;
@@ -542,24 +576,34 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
   }
 #endif
 
-  if (mLinkAudioEnabled && !mAudioIns.empty()) {
-    for (size_t ch = 0; ch < mLinkAudioInChannels; ++ch) {
-      auto *inBuf = static_cast<float *>(
-          jack_port_get_buffer(mAudioIns[ch], nframes));
-      for (jack_nframes_t i = 0; i < nframes; ++i)
-        mSendPtrs[ch][i] = static_cast<double>(inBuf[i]);
+  if (mLinkAudioEnabled && (!mSendRenderers.empty() || !mRecvRenderers.empty())) {
+    auto sessionState = mLink.captureAudioSessionState();
+
+    for (size_t i = 0; i < mNumStereoInChannels; ++i) {
+      double* sendPtrs[2];
+      for (size_t ch = 0; ch < 2; ++ch) {
+        sendPtrs[ch] = mStereoSendBuf.data() + (i * 2 + ch) * nframes;
+        const auto *inBuf = static_cast<const float *>(
+            jack_port_get_buffer(mAudioIns[i * 2 + ch], nframes));
+        for (jack_nframes_t f = 0; f < nframes; ++f)
+          sendPtrs[ch][f] = static_cast<double>(inBuf[f]);
+      }
+      mSendRenderers[i]->send(sendPtrs, nframes, sessionState,
+                              mSampleRate, mTimeNext, mQuantum);
     }
 
-    auto sessionState = mLink.captureAudioSessionState();
-    mLinkAudioRenderer(mSendPtrs.data(), mRecvPtrs.data(),
-                       nframes, sessionState, mSampleRate,
-                       mTimeNext, mQuantum);
-
-    for (size_t ch = 0; ch < mLinkAudioOutChannels; ++ch) {
-      auto *outBuf = static_cast<float *>(
-          jack_port_get_buffer(mAudioOuts[ch], nframes));
-      for (jack_nframes_t i = 0; i < nframes; ++i)
-        outBuf[i] = static_cast<float>(mRecvPtrs[ch][i]);
+    for (size_t i = 0; i < mNumStereoOutChannels; ++i) {
+      double* recvPtrs[2];
+      for (size_t ch = 0; ch < 2; ++ch)
+        recvPtrs[ch] = mStereoRecvBuf.data() + (i * 2 + ch) * nframes;
+      mRecvRenderers[i]->receive(recvPtrs, nframes, sessionState,
+                                 mSampleRate, mTimeNext, mQuantum);
+      for (size_t ch = 0; ch < 2; ++ch) {
+        auto *outBuf = static_cast<float *>(
+            jack_port_get_buffer(mAudioOuts[i * 2 + ch], nframes));
+        for (jack_nframes_t f = 0; f < nframes; ++f)
+          outBuf[f] = static_cast<float>(recvPtrs[ch][f]);
+      }
     }
   }
 
@@ -673,6 +717,7 @@ void JackTransportLink::propertyChangeCallback(jack_uuid_t subject,
     bool islinksync = !key || linksync_key.compare(key) == 0;
     bool isenable = !key || start_stop_key.compare(key) == 0;
     bool islinkaudiosource = !key || linkaudio_source_key.compare(key) == 0;
+    int  linkaudiosourceidx = key ? linkAudioSourceIndex(key) : -1;
     if (change == jack_property_change_t::PropertyChanged) {
       std::string values;
       std::string types;
@@ -700,8 +745,22 @@ void JackTransportLink::propertyChangeCallback(jack_uuid_t subject,
         }
       } else if (mLinkAudioEnabled && islinkaudiosource &&
                  get_property(mJackClientUUID, linkaudio_source_key, values, types)) {
-        if (parseLinkAudioSourceFilter(values, mLinkAudioPeerFilter, mLinkAudioChannelFilter))
+        if (parseLinkAudioSourceFilters(values, mLinkAudioPeerFilters, mLinkAudioChannelFilters))
           mNeedsSourceUpdate.store(true, std::memory_order_release);
+      } else if (mLinkAudioEnabled && linkaudiosourceidx >= 0
+                 && static_cast<size_t>(linkaudiosourceidx) < mRecvRenderers.size()) {
+        const auto indexKey = linkaudio_source_key + "/" + std::to_string(linkaudiosourceidx);
+        if (get_property(mJackClientUUID, indexKey, values, types)) {
+          try {
+            auto j = nlohmann::json::parse(values);
+            if (j.is_object()) {
+              const size_t i = static_cast<size_t>(linkaudiosourceidx);
+              mLinkAudioPeerFilters[i]    = j.value("peer",    "");
+              mLinkAudioChannelFilters[i] = j.value("channel", "");
+              mNeedsSourceUpdate.store(true, std::memory_order_release);
+            }
+          } catch (...) {}
+        }
       }
     } else if (change == jack_property_change_t::PropertyDeleted) {
       if (isbpm)
@@ -710,6 +769,13 @@ void JackTransportLink::propertyChangeCallback(jack_uuid_t subject,
         mReportStartStopEnable = true;
       if (islinksync)
         mReportLinkSync = true;
+      if (mLinkAudioEnabled && linkaudiosourceidx >= 0
+          && static_cast<size_t>(linkaudiosourceidx) < mRecvRenderers.size()) {
+        const size_t i = static_cast<size_t>(linkaudiosourceidx);
+        mLinkAudioPeerFilters[i]    = {};
+        mLinkAudioChannelFilters[i] = {};
+        mNeedsSourceUpdate.store(true, std::memory_order_release);
+      }
     }
   }
 }
@@ -771,14 +837,20 @@ void JackTransportLink::setLinkAudioChannelsProperty(
 
 void JackTransportLink::setLinkAudioSourceProperty() {
   if (jack_uuid_empty(mJackClientUUID)) return;
-  nlohmann::json j;
-  if (mCurrentSourceChannelId.has_value()) {
-    j = {{"peer", mCurrentSourcePeerName}, {"channel", mCurrentSourceChannelName}};
+  nlohmann::json arr = nlohmann::json::array();
+  for (size_t i = 0; i < mRecvRenderers.size(); ++i) {
+    nlohmann::json entry = nlohmann::json::object();
+    if (mCurrentSourceChannelIds[i].has_value()) {
+      entry = {{"peer", mCurrentSourcePeerNames[i]},
+               {"channel", mCurrentSourceChannelNames[i]}};
+    }
+    arr.push_back(entry);
+    const auto indexKey = linkaudio_source_key + "/" + std::to_string(i);
+    jack_set_property(mJackClient, mJackClientUUID, indexKey.c_str(),
+                      entry.dump().c_str(), "application/json");
   }
-  // else: empty object {} signals auto-select
-  const auto value = j.dump();
   jack_set_property(mJackClient, mJackClientUUID, linkaudio_source_key.c_str(),
-                    value.c_str(), "application/json");
+                    arr.dump().c_str(), "application/json");
 }
 
 static std::string toLower(std::string s) {
@@ -786,15 +858,15 @@ static std::string toLower(std::string s) {
   return s;
 }
 
-void JackTransportLink::updateLinkAudioSource() {
+bool JackTransportLink::updateLinkAudioSource() {
   auto channels = mLink.channels();
+  bool anyChanged = false;
 
-  std::optional<ableton::LinkAudio::Channel> target;
-  if (mLinkAudioPeerFilter.empty() && mLinkAudioChannelFilter.empty()) {
-    if (!channels.empty()) target = channels[0];
-  } else {
-    const auto peerNeedle    = toLower(mLinkAudioPeerFilter);
-    const auto channelNeedle = toLower(mLinkAudioChannelFilter);
+  for (size_t i = 0; i < mRecvRenderers.size(); ++i) {
+    const auto peerNeedle    = toLower(mLinkAudioPeerFilters[i]);
+    const auto channelNeedle = toLower(mLinkAudioChannelFilters[i]);
+
+    std::optional<ableton::LinkAudio::Channel> target;
     for (const auto& ch : channels) {
       bool peerMatch    = peerNeedle.empty()
                           || toLower(ch.peerName).find(peerNeedle) != std::string::npos;
@@ -805,27 +877,30 @@ void JackTransportLink::updateLinkAudioSource() {
         break;
       }
     }
-  }
 
-  if (target) {
-    bool needSwitch = !mLinkAudioRenderer.hasSource()
-        || !mCurrentSourceChannelId.has_value()
-        || (*mCurrentSourceChannelId != target->id);
-    if (needSwitch) {
-      mLinkAudioRenderer.removeSource();
-      mLinkAudioRenderer.createSource(target->id);
-      mCurrentSourceChannelId   = target->id;
-      mCurrentSourcePeerName    = target->peerName;
-      mCurrentSourceChannelName = target->name;
-    }
-  } else {
-    if (mLinkAudioRenderer.hasSource()) {
-      mLinkAudioRenderer.removeSource();
-      mCurrentSourceChannelId   = std::nullopt;
-      mCurrentSourcePeerName    = {};
-      mCurrentSourceChannelName = {};
+    if (target) {
+      bool needSwitch = !mRecvRenderers[i]->hasSource()
+          || !mCurrentSourceChannelIds[i].has_value()
+          || (*mCurrentSourceChannelIds[i] != target->id);
+      if (needSwitch) {
+        mRecvRenderers[i]->removeSource();
+        mRecvRenderers[i]->createSource(target->id);
+        mCurrentSourceChannelIds[i]   = target->id;
+        mCurrentSourcePeerNames[i]    = target->peerName;
+        mCurrentSourceChannelNames[i] = target->name;
+        anyChanged = true;
+      }
+    } else {
+      if (mRecvRenderers[i]->hasSource()) {
+        mRecvRenderers[i]->removeSource();
+        mCurrentSourceChannelIds[i]   = std::nullopt;
+        mCurrentSourcePeerNames[i]    = {};
+        mCurrentSourceChannelNames[i] = {};
+        anyChanged = true;
+      }
     }
   }
+  return anyChanged;
 }
 
 void JackTransportLink::invalidateClockSyncBBT() {
@@ -888,8 +963,27 @@ void JackTransportLink::ProcessMessage(
                std::strcmp("/jacklink/linkaudio/source", m.AddressPattern()) == 0) {
       if (arg != m.ArgumentsEnd() && arg->IsString()) {
         std::string v = arg->AsStringUnchecked();
-        if (parseLinkAudioSourceFilter(v, mLinkAudioPeerFilter, mLinkAudioChannelFilter))
+        if (parseLinkAudioSourceFilters(v, mLinkAudioPeerFilters, mLinkAudioChannelFilters))
           mNeedsSourceUpdate.store(true, std::memory_order_release);
+      }
+    } else if (mLinkAudioEnabled
+               && std::strncmp("/jacklink/linkaudio/source/", m.AddressPattern(),
+                                sizeof("/jacklink/linkaudio/source/") - 1) == 0) {
+      const char* idxStr = m.AddressPattern() + sizeof("/jacklink/linkaudio/source/") - 1;
+      char* end;
+      long idx = std::strtol(idxStr, &end, 10);
+      if (*end == '\0' && idx >= 0
+          && static_cast<size_t>(idx) < mRecvRenderers.size()
+          && arg != m.ArgumentsEnd() && arg->IsString()) {
+        try {
+          auto j = nlohmann::json::parse(arg->AsStringUnchecked());
+          if (j.is_object()) {
+            const size_t i = static_cast<size_t>(idx);
+            mLinkAudioPeerFilters[i]    = j.value("peer",    "");
+            mLinkAudioChannelFilters[i] = j.value("channel", "");
+            mNeedsSourceUpdate.store(true, std::memory_order_release);
+          }
+        } catch (...) {}
       }
     }
   } catch (oscpack::Exception &e) {
