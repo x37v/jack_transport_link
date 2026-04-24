@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.16...3.31)
 
+include(FetchContent)
+
 set(PROJECT_VERSION "0.0.13")
 set(CPACK_DEBIAN_PACKAGE_RELEASE 1) #set to 1 if we inc PROJECT_VERSION, incr if we need to package new with same PROJECT_VERSION
 
@@ -26,20 +28,23 @@ endif()
 find_package(PkgConfig REQUIRED)
 
 if (JACK_DIR)
-	find_library(JACK_LIB "jack"
-		PATHS ${JACK_DIR}/lib/
-		NO_DEFAULT_PATH
-		NO_CMAKE_FIND_ROOT_PATH
-	)
-	find_path(JACK_INCLUDE_DIR jack/jack.h REQUIRED
-		PATHS ${JACK_DIR}/include/
-		NO_DEFAULT_PATH
-		NO_CMAKE_FIND_ROOT_PATH
-	)
+  find_library(JACK_LIB "jack"
+    PATHS ${JACK_DIR}/lib/
+    NO_DEFAULT_PATH
+    NO_CMAKE_FIND_ROOT_PATH
+  )
+  find_path(JACK_INCLUDE_DIR jack/jack.h REQUIRED
+    PATHS ${JACK_DIR}/include/
+    NO_DEFAULT_PATH
+    NO_CMAKE_FIND_ROOT_PATH
+  )
 else()
-	find_library(JACK_LIB "jack")
-	find_path(JACK_INCLUDE_DIR jack/jack.h REQUIRED)
+  find_library(JACK_LIB "jack")
+  find_path(JACK_INCLUDE_DIR jack/jack.h REQUIRED)
 endif()
+
+FetchContent_Declare(json URL https://github.com/nlohmann/json/releases/download/v3.12.0/json.tar.xz)
+FetchContent_MakeAvailable(json)
 
 include(3rdparty/link/AbletonLinkConfig.cmake)
 
@@ -47,7 +52,7 @@ include_directories(
   ./src/
   ./3rdparty/link/include/
   ./3rdparty/cpp-optparse/
-	${JACK_INCLUDE_DIR}
+  ${JACK_INCLUDE_DIR}
 )
 
 add_subdirectory(./3rdparty/oscpack/)
@@ -70,9 +75,10 @@ target_link_libraries(
   PRIVATE
   ${PLATFORM_LIBS}
   Ableton::Link
-	${JACK_LIB}
+  ${JACK_LIB}
+  nlohmann_json::nlohmann_json
+  oscpack
 )
-target_link_libraries(${PROJECT_APP} PRIVATE oscpack)
 
 install(TARGETS ${PROJECT_APP} DESTINATION bin)
 
@@ -130,12 +136,12 @@ if (LINUX)
     SET(CPACK_DEBIAN_PACKAGE_PRIORITY "optional")
     SET(CPACK_DEBIAN_PACKAGE_SECTION "sound")
 
-		#remove the local component from the deb as it references /usr/ not /usr/local/
-		get_cmake_property(CPACK_COMPONENTS_ALL COMPONENTS)
-		message(STATUS "components ${CPACK_COMPONENTS_ALL}")
-		list(REMOVE_ITEM CPACK_COMPONENTS_ALL "local")
-		SET(CPACK_DEB_COMPONENT_INSTALL ON)
-		SET(CPACK_COMPONENTS_GROUPING "ALL_COMPONENTS_IN_ONE")
+    #remove the local component from the deb as it references /usr/ not /usr/local/
+    get_cmake_property(CPACK_COMPONENTS_ALL COMPONENTS)
+    message(STATUS "components ${CPACK_COMPONENTS_ALL}")
+    list(REMOVE_ITEM CPACK_COMPONENTS_ALL "local")
+    SET(CPACK_DEB_COMPONENT_INSTALL ON)
+    SET(CPACK_COMPONENTS_GROUPING "ALL_COMPONENTS_IN_ONE")
 
     set(CPACK_DEBIAN_PACKAGE_CONTROL_EXTRA "${CMAKE_CURRENT_SOURCE_DIR}/debian/copyright")
     if (INSTALL_SERVICE_FILE)

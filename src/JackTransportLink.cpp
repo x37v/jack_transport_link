@@ -2,6 +2,9 @@
 
 #include <jack/midiport.h>
 #include <jack/uuid.h>
+#include <algorithm>
+#include <map>
+#include <nlohmann/json.hpp>
 #include <optional>
 #include <string>
 
@@ -24,6 +27,10 @@ const std::string
     linknumpeers_key("http://www.x37v.info/jack/metadata/linkpeers");
 const std::string
     start_stop_key("http://www.x37v.info/jack/metadata/link/start-stop-sync");
+const std::string
+    linkaudio_source_key("http://www.x37v.info/jack/metadata/linkaudio/source");
+const std::string
+    linkaudio_peers_key("http://www.x37v.info/jack/metadata/linkaudio/peers");
 const std::array<std::string, 2> true_values = {"true", "1"};
 
 const std::array<uint8_t, 1> midi_clock_buf = {248};
@@ -63,6 +70,25 @@ GetOscDouble(const oscpack::ReceivedMessageArgument &arg) {
     return static_cast<double>(arg.AsInt32());
   }
   return std::nullopt;
+}
+
+// Parse {"peer":"...","channel":"..."} or "auto" into filter strings.
+// Returns false if the string is not a recognised format.
+bool parseLinkAudioSourceFilter(const std::string& s,
+                                std::string& peerOut,
+                                std::string& channelOut) {
+  if (s == "auto") {
+    peerOut = channelOut = "";
+    return true;
+  }
+  try {
+    auto j = nlohmann::json::parse(s);
+    peerOut    = j.value("peer",    "");
+    channelOut = j.value("channel", "");
+    return true;
+  } catch (...) {
+    return false;
+  }
 }
 
 } // namespace
@@ -146,6 +172,10 @@ JackTransportLink::JackTransportLink(jack_client_t *client,
 #endif
 
   mLinkAudioEnabled = enableLinkAudio;
+  if (mLinkAudioEnabled && !jack_uuid_empty(mJackClientUUID)) {
+    setLinkAudioSourceProperty();
+    setLinkAudioPeersProperty({});
+  }
   if (mLinkAudioEnabled) {
     jack_nframes_t bufSize = jack_get_buffer_size(mJackClient);
     mAudioSendBuf.resize(bufSize * mLinkAudioInChannels);
@@ -210,13 +240,25 @@ int JackTransportLink::bufferSizeCallback(jack_nframes_t nframes) {
 }
 
 void JackTransportLink::processEvents() {
-  if (mLinkAudioEnabled && mChannelsChanged.load(std::memory_order_acquire)) {
-    mChannelsChanged.store(false, std::memory_order_release);
-    auto channels = mLink.channels();
-    if (!mLinkAudioRenderer.hasSource() && !channels.empty()) {
-      mLinkAudioRenderer.createSource(channels[0].id);
-    } else if (mLinkAudioRenderer.hasSource() && channels.empty()) {
-      mLinkAudioRenderer.removeSource();
+  if (mLinkAudioEnabled) {
+    if (mChannelsChanged.load(std::memory_order_acquire)) {
+      mChannelsChanged.store(false, std::memory_order_release);
+      updateLinkAudioSource();
+      mReportLinkAudioPeers  = true;
+      mReportLinkAudioSource = true;
+    }
+    if (mNeedsSourceUpdate.load(std::memory_order_acquire)) {
+      mNeedsSourceUpdate.store(false, std::memory_order_release);
+      updateLinkAudioSource();
+      mReportLinkAudioSource = true;
+    }
+    if (mReportLinkAudioPeers) {
+      mReportLinkAudioPeers = false;
+      setLinkAudioPeersProperty(mLink.channels());
+    }
+    if (mReportLinkAudioSource) {
+      mReportLinkAudioSource = false;
+      setLinkAudioSourceProperty();
     }
   }
   if (mReportBPM) {
@@ -634,6 +676,7 @@ void JackTransportLink::propertyChangeCallback(jack_uuid_t subject,
     bool isbpm = !key || bpm_key.compare(key) == 0;
     bool islinksync = !key || linksync_key.compare(key) == 0;
     bool isenable = !key || start_stop_key.compare(key) == 0;
+    bool islinkaudiosource = !key || linkaudio_source_key.compare(key) == 0;
     if (change == jack_property_change_t::PropertyChanged) {
       std::string values;
       std::string types;
@@ -659,6 +702,10 @@ void JackTransportLink::propertyChangeCallback(jack_uuid_t subject,
           mBPM.store(mLinkBPM, std::memory_order_release);
           mReportBPM = true;
         }
+      } else if (mLinkAudioEnabled && islinkaudiosource &&
+                 get_property(mJackClientUUID, linkaudio_source_key, values, types)) {
+        if (parseLinkAudioSourceFilter(values, mLinkAudioPeerFilter, mLinkAudioChannelFilter))
+          mNeedsSourceUpdate.store(true, std::memory_order_release);
       }
     } else if (change == jack_property_change_t::PropertyDeleted) {
       if (isbpm)
@@ -700,6 +747,90 @@ void JackTransportLink::setNumPeersProperty(size_t peers) {
     std::string s = std::to_string(peers);
     jack_set_property(mJackClient, mJackClientUUID, linknumpeers_key.c_str(),
                       s.c_str(), int_type);
+  }
+}
+
+void JackTransportLink::setLinkAudioPeersProperty(
+    const std::vector<ableton::LinkAudio::Channel>& channels) {
+  if (jack_uuid_empty(mJackClientUUID)) return;
+
+  // Group channels by peer name, preserving first-seen order
+  nlohmann::json peers = nlohmann::json::array();
+  std::vector<std::string> order;
+  std::map<std::string, nlohmann::json> byPeer;
+  for (const auto& ch : channels) {
+    if (byPeer.find(ch.peerName) == byPeer.end()) {
+      order.push_back(ch.peerName);
+      byPeer[ch.peerName] = {{"peer", ch.peerName}, {"channels", nlohmann::json::array()}};
+    }
+    byPeer[ch.peerName]["channels"].push_back(ch.name);
+  }
+  for (const auto& name : order)
+    peers.push_back(byPeer[name]);
+
+  const auto value = peers.dump();
+  jack_set_property(mJackClient, mJackClientUUID, linkaudio_peers_key.c_str(),
+                    value.c_str(), "application/json");
+}
+
+void JackTransportLink::setLinkAudioSourceProperty() {
+  if (jack_uuid_empty(mJackClientUUID)) return;
+  std::string value;
+  if (mCurrentSourceChannelId.has_value()) {
+    nlohmann::json j = {{"peer", mCurrentSourcePeerName},
+                        {"channel", mCurrentSourceChannelName}};
+    value = j.dump();
+  } else {
+    value = "auto";
+  }
+  jack_set_property(mJackClient, mJackClientUUID, linkaudio_source_key.c_str(),
+                    value.c_str(), "application/json");
+}
+
+static std::string toLower(std::string s) {
+  std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+  return s;
+}
+
+void JackTransportLink::updateLinkAudioSource() {
+  auto channels = mLink.channels();
+
+  std::optional<ableton::LinkAudio::Channel> target;
+  if (mLinkAudioPeerFilter.empty() && mLinkAudioChannelFilter.empty()) {
+    if (!channels.empty()) target = channels[0];
+  } else {
+    const auto peerNeedle    = toLower(mLinkAudioPeerFilter);
+    const auto channelNeedle = toLower(mLinkAudioChannelFilter);
+    for (const auto& ch : channels) {
+      bool peerMatch    = peerNeedle.empty()
+                          || toLower(ch.peerName).find(peerNeedle) != std::string::npos;
+      bool channelMatch = channelNeedle.empty()
+                          || toLower(ch.name).find(channelNeedle) != std::string::npos;
+      if (peerMatch && channelMatch) {
+        target = ch;
+        break;
+      }
+    }
+  }
+
+  if (target) {
+    bool needSwitch = !mLinkAudioRenderer.hasSource()
+        || !mCurrentSourceChannelId.has_value()
+        || (*mCurrentSourceChannelId != target->id);
+    if (needSwitch) {
+      mLinkAudioRenderer.removeSource();
+      mLinkAudioRenderer.createSource(target->id);
+      mCurrentSourceChannelId   = target->id;
+      mCurrentSourcePeerName    = target->peerName;
+      mCurrentSourceChannelName = target->name;
+    }
+  } else {
+    if (mLinkAudioRenderer.hasSource()) {
+      mLinkAudioRenderer.removeSource();
+      mCurrentSourceChannelId   = std::nullopt;
+      mCurrentSourcePeerName    = {};
+      mCurrentSourceChannelName = {};
+    }
   }
 }
 
@@ -758,6 +889,13 @@ void JackTransportLink::ProcessMessage(
         } else {
           jack_transport_stop(mJackClient);
         }
+      }
+    } else if (mLinkAudioEnabled &&
+               std::strcmp("/jacklink/linkaudio/source", m.AddressPattern()) == 0) {
+      if (arg != m.ArgumentsEnd() && arg->IsString()) {
+        std::string v = arg->AsStringUnchecked();
+        if (parseLinkAudioSourceFilter(v, mLinkAudioPeerFilter, mLinkAudioChannelFilter))
+          mNeedsSourceUpdate.store(true, std::memory_order_release);
       }
     }
   } catch (oscpack::Exception &e) {

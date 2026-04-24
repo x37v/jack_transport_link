@@ -2,6 +2,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <optional>
+#include <string>
 #include <vector>
 
 #include <jack/jack.h>
@@ -15,13 +17,6 @@
 
 #include <osc/OscPacketListener.h>
 #include <osc/OscReceivedElements.h>
-
-/// XXX OSC CONTROL??
-///
-/// position
-/// start/stop
-/// bpm??
-/// sync to link vs internal?
 
 class JackTransportLink : public oscpack::OscPacketListener {
 public:
@@ -66,6 +61,9 @@ private:
   void setEnableStartStopProperty(bool enable);
   void setSyncProperty(bool sync);
   void setNumPeersProperty(size_t peers);
+  void setLinkAudioPeersProperty(const std::vector<ableton::LinkAudio::Channel>& channels);
+  void setLinkAudioSourceProperty();
+  void updateLinkAudioSource();
 
   void invalidateClockSyncBBT();
 
@@ -122,4 +120,14 @@ private:
   std::vector<jack_port_t*> mAudioOuts;
   std::atomic<bool> mChannelsChanged{false};
   bool mLinkAudioEnabled = false;
+
+  // Link Audio source selection — filters written from property/OSC callbacks, read in processEvents
+  std::string mLinkAudioPeerFilter;    // empty = any peer (auto)
+  std::string mLinkAudioChannelFilter; // empty = any channel
+  std::optional<ableton::ChannelId> mCurrentSourceChannelId;
+  std::string mCurrentSourcePeerName;
+  std::string mCurrentSourceChannelName;
+  std::atomic<bool> mNeedsSourceUpdate{false};
+  bool mReportLinkAudioPeers = false;
+  bool mReportLinkAudioSource = false;
 };
