@@ -30,7 +30,7 @@ const std::string
 const std::string
     linkaudio_source_key("http://www.x37v.info/jack/metadata/linkaudio/source");
 const std::string
-    linkaudio_peers_key("http://www.x37v.info/jack/metadata/linkaudio/peers");
+    linkaudio_channels_key("http://www.x37v.info/jack/metadata/linkaudio/channels");
 const std::array<std::string, 2> true_values = {"true", "1"};
 
 const std::array<uint8_t, 1> midi_clock_buf = {248};
@@ -72,15 +72,11 @@ GetOscDouble(const oscpack::ReceivedMessageArgument &arg) {
   return std::nullopt;
 }
 
-// Parse {"peer":"...","channel":"..."} or "auto" into filter strings.
-// Returns false if the string is not a recognised format.
+// Parse {"peer":"...","channel":"..."} into filter strings.
+// An empty object {} clears both filters (auto-select). Returns false on parse error.
 bool parseLinkAudioSourceFilter(const std::string& s,
                                 std::string& peerOut,
                                 std::string& channelOut) {
-  if (s == "auto") {
-    peerOut = channelOut = "";
-    return true;
-  }
   try {
     auto j = nlohmann::json::parse(s);
     peerOut    = j.value("peer",    "");
@@ -174,7 +170,7 @@ JackTransportLink::JackTransportLink(jack_client_t *client,
   mLinkAudioEnabled = enableLinkAudio;
   if (mLinkAudioEnabled && !jack_uuid_empty(mJackClientUUID)) {
     setLinkAudioSourceProperty();
-    setLinkAudioPeersProperty({});
+    setLinkAudioChannelsProperty({});
   }
   if (mLinkAudioEnabled) {
     jack_nframes_t bufSize = jack_get_buffer_size(mJackClient);
@@ -244,7 +240,7 @@ void JackTransportLink::processEvents() {
     if (mChannelsChanged.load(std::memory_order_acquire)) {
       mChannelsChanged.store(false, std::memory_order_release);
       updateLinkAudioSource();
-      mReportLinkAudioPeers  = true;
+      mReportLinkAudioChannels  = true;
       mReportLinkAudioSource = true;
     }
     if (mNeedsSourceUpdate.load(std::memory_order_acquire)) {
@@ -252,9 +248,9 @@ void JackTransportLink::processEvents() {
       updateLinkAudioSource();
       mReportLinkAudioSource = true;
     }
-    if (mReportLinkAudioPeers) {
-      mReportLinkAudioPeers = false;
-      setLinkAudioPeersProperty(mLink.channels());
+    if (mReportLinkAudioChannels) {
+      mReportLinkAudioChannels = false;
+      setLinkAudioChannelsProperty(mLink.channels());
     }
     if (mReportLinkAudioSource) {
       mReportLinkAudioSource = false;
@@ -750,7 +746,7 @@ void JackTransportLink::setNumPeersProperty(size_t peers) {
   }
 }
 
-void JackTransportLink::setLinkAudioPeersProperty(
+void JackTransportLink::setLinkAudioChannelsProperty(
     const std::vector<ableton::LinkAudio::Channel>& channels) {
   if (jack_uuid_empty(mJackClientUUID)) return;
 
@@ -769,20 +765,18 @@ void JackTransportLink::setLinkAudioPeersProperty(
     peers.push_back(byPeer[name]);
 
   const auto value = peers.dump();
-  jack_set_property(mJackClient, mJackClientUUID, linkaudio_peers_key.c_str(),
+  jack_set_property(mJackClient, mJackClientUUID, linkaudio_channels_key.c_str(),
                     value.c_str(), "application/json");
 }
 
 void JackTransportLink::setLinkAudioSourceProperty() {
   if (jack_uuid_empty(mJackClientUUID)) return;
-  std::string value;
+  nlohmann::json j;
   if (mCurrentSourceChannelId.has_value()) {
-    nlohmann::json j = {{"peer", mCurrentSourcePeerName},
-                        {"channel", mCurrentSourceChannelName}};
-    value = j.dump();
-  } else {
-    value = "auto";
+    j = {{"peer", mCurrentSourcePeerName}, {"channel", mCurrentSourceChannelName}};
   }
+  // else: empty object {} signals auto-select
+  const auto value = j.dump();
   jack_set_property(mJackClient, mJackClientUUID, linkaudio_source_key.c_str(),
                     value.c_str(), "application/json");
 }

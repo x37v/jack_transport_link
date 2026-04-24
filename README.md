@@ -77,6 +77,64 @@ To get the current bpm property.
 jack_property --client jack-transport-link --list http://www.x37v.info/jack/metadata/bpm
 ```
 
+## OSC Control
+
+Pass `-o <port>` to enable the OSC listener. All messages are sent to that UDP port.
+
+| Address | Argument | Description |
+|---------|----------|-------------|
+| `/jacklink/bpm` | `float` or `double` | Set the tempo in beats per minute. |
+| `/jacklink/beattime` | `float` or `double` | Seek the transport to the given beat position. |
+| `/jacklink/sync` | `bool` | Enable (`true`) or disable (`false`) Link sync. |
+| `/jacklink/rolling` | `bool` | Start (`true`) or stop (`false`) the transport. |
+| `/jacklink/linkaudio/source` | `string` (JSON) | Select the Link Audio source. See [Link Audio](#link-audio) below. |
+
+## Link Audio
+
+Link Audio streams real-time audio between peers in a Link session with beat-grid alignment. It is enabled by default (disable with `--no-link-audio`).
+
+JACK ports `in_1`/`in_2` (configurable with `--link-audio-in-channels`) capture audio and send it to peers. JACK ports `out_1`/`out_2` (configurable with `--link-audio-out-channels`) play back audio received from a peer.
+
+### Selecting a source
+
+By default the first available peer is subscribed automatically. To select a specific peer, set the `linkaudio/source` Jack metadata property or send an OSC message to `/jacklink/linkaudio/source`.
+
+The value is a JSON object:
+
+```json
+{"peer": "Alex's MacBook", "channel": "Link Audio"}
+```
+
+Both fields are case-insensitive substring filters — either can be omitted to match anything. To revert to auto-selection, pass an empty object `{}`.
+
+The property always reflects the current connection state: it shows the actual peer and channel name when connected, or `{}` when no source is active.
+
+```shell
+# Select a source by peer name substring
+jack_property --client jack-transport-link \
+  http://www.x37v.info/jack/metadata/linkaudio/source \
+  '{"peer":"Push"}' application/json
+
+# Revert to auto
+jack_property --client jack-transport-link \
+  http://www.x37v.info/jack/metadata/linkaudio/source \
+  '{}' application/json
+
+# Read the current source
+jack_property --client jack-transport-link --list \
+  http://www.x37v.info/jack/metadata/linkaudio/source
+
+# List available channels
+jack_property --client jack-transport-link --list \
+  http://www.x37v.info/jack/metadata/linkaudio/channels
+```
+
+The `linkaudio/channels` property is read-only and updated automatically. Its value is a JSON array grouped by peer:
+
+```json
+[{"peer": "Alex's MacBook", "channels": ["Link Audio"]}, {"peer": "Push 3", "channels": ["Main", "Cue"]}]
+```
+
 ## TODO
 
 * Latency Compensation computation

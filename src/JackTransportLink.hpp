@@ -61,7 +61,7 @@ private:
   void setEnableStartStopProperty(bool enable);
   void setSyncProperty(bool sync);
   void setNumPeersProperty(size_t peers);
-  void setLinkAudioPeersProperty(const std::vector<ableton::LinkAudio::Channel>& channels);
+  void setLinkAudioChannelsProperty(const std::vector<ableton::LinkAudio::Channel>& channels);
   void setLinkAudioSourceProperty();
   void updateLinkAudioSource();
 
@@ -128,6 +128,6 @@ private:
   std::string mCurrentSourcePeerName;
   std::string mCurrentSourceChannelName;
   std::atomic<bool> mNeedsSourceUpdate{false};
-  bool mReportLinkAudioPeers = false;
+  bool mReportLinkAudioChannels = false;
   bool mReportLinkAudioSource = false;
 };
