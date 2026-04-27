@@ -1181,6 +1181,10 @@ void JackTransportLink::rebuildAudioPorts(size_t newIn, size_t newOut) {
     mNeedsSourceUpdate.store(true, std::memory_order_release);
 
   if (!jack_uuid_empty(mJackClientUUID)) {
+    for (size_t i = newOut; i < oldOut; ++i) {
+      const auto key = linkaudio_source_key + "/" + std::to_string(i);
+      jack_remove_property(mJackClient, mJackClientUUID, key.c_str());
+    }
     setLinkAudioInStereoChannelsProperty(newIn);
     setLinkAudioOutStereoChannelsProperty(newOut);
     setLinkAudioSourceProperty();
