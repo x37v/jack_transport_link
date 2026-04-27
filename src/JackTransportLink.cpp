@@ -297,13 +297,11 @@ void JackTransportLink::processEvents() {
     }
   }
   if (mLinkAudioEnabled) {
-    if (mChannelsChanged.load(std::memory_order_acquire)) {
-      mChannelsChanged.store(false, std::memory_order_release);
+    if (mChannelsChanged.exchange(false, std::memory_order_acq_rel)) {
       if (updateLinkAudioSource()) mReportLinkAudioSource = true;
       mReportLinkAudioChannels = true;
     }
-    if (mNeedsSourceUpdate.load(std::memory_order_acquire)) {
-      mNeedsSourceUpdate.store(false, std::memory_order_release);
+    if (mNeedsSourceUpdate.exchange(false, std::memory_order_acq_rel)) {
       if (updateLinkAudioSource()) mReportLinkAudioSource = true;
     }
     if (mReportLinkAudioChannels) {
