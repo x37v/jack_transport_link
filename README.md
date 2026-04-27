@@ -77,6 +77,12 @@ To get the current bpm property.
 jack_property --client jack-transport-link --list http://www.x37v.info/jack/metadata/bpm
 ```
 
+## Config File
+
+Settings are persisted to `~/.config/jack-transport-link/config.json` (respects `$XDG_CONFIG_HOME`). Override with `-c <path>`. CLI flags take precedence over config values.
+
+Saved fields: `bpm`, `quantum`, `time_sig_denom`, `ticks_per_beat`, `start_stop_sync`, `sync`, `link_audio_enabled`, `in_stereo_channels`, `out_stereo_channels`, `source_filters`.
+
 ## OSC Control
 
 Pass `-o <port>` to enable the OSC listener. All messages are sent to that UDP port.
@@ -89,6 +95,8 @@ Pass `-o <port>` to enable the OSC listener. All messages are sent to that UDP p
 | `/jacklink/rolling` | `bool` | Start (`true`) or stop (`false`) the transport. |
 | `/jacklink/linkaudio/source` | `string` (JSON) | Set source filter for all receivers (object or array). See [Link Audio](#link-audio). |
 | `/jacklink/linkaudio/source/<N>` | `string` (JSON object) | Set source filter for receiver N (zero-based). |
+| `/jacklink/linkaudio/in-stereo-channels` | `int` | Change the number of stereo send pairs at runtime. |
+| `/jacklink/linkaudio/out-stereo-channels` | `int` | Change the number of stereo receive pairs at runtime. |
 
 ## Link Audio
 
@@ -138,6 +146,14 @@ jack_property --client jack-transport-link --list \
 # List available channels
 jack_property --client jack-transport-link --list \
   http://www.x37v.info/jack/metadata/linkaudio/channels
+```
+
+The `linkaudio/in-stereo-channels` and `linkaudio/out-stereo-channels` properties (integer type) can be written to change the number of stereo pairs at runtime:
+
+```shell
+jack_property --client jack-transport-link \
+  http://www.x37v.info/jack/metadata/linkaudio/in-stereo-channels 2 \
+  https://www.w3.org/2001/XMLSchema#integer
 ```
 
 The `linkaudio/channels` property is read-only and updated automatically. Its value is a JSON array grouped by peer:

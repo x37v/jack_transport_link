@@ -34,10 +34,13 @@ public:
                     double initialTicksPerBeat = 1920.,
                     bool enableLinkAudio = true,
                     size_t linkAudioStereoInChannels = 1,
-                    size_t linkAudioStereoOutChannels = 1);
+                    size_t linkAudioStereoOutChannels = 1,
+                    bool syncLink = true,
+                    std::string configPath = "");
   ~JackTransportLink();
 
   void processEvents();
+  void applySourceFiltersFromConfig(const std::string& jsonText);
 
   static int processCallback(jack_nframes_t nframes, void *arg);
   static void timeBaseCallback(jack_transport_state_t state,
@@ -67,7 +70,11 @@ private:
   void setNumPeersProperty(size_t peers);
   void setLinkAudioChannelsProperty(const std::vector<ableton::LinkAudio::Channel>& channels);
   void setLinkAudioSourceProperty();
+  void setLinkAudioInStereoChannelsProperty(size_t n);
+  void setLinkAudioOutStereoChannelsProperty(size_t n);
   bool updateLinkAudioSource();
+  void rebuildAudioPorts(size_t newIn, size_t newOut);
+  void saveConfig();
 
   void invalidateClockSyncBBT();
 
@@ -89,8 +96,8 @@ private:
 
   jack_port_t *mClickPort = nullptr;
   double mInternalBeat = 0.0;
-  bool mSyncLink = true;
-  bool mWasSyncLink = true;
+  bool mSyncLink;
+  bool mWasSyncLink;
 
   int32_t mBeatLast = -1;
   int32_t mBarLast = -1;
@@ -135,6 +142,12 @@ private:
   std::vector<std::string> mCurrentSourcePeerNames;
   std::vector<std::string> mCurrentSourceChannelNames;
   std::atomic<bool> mNeedsSourceUpdate{false};
+  std::atomic<int> mRequestedStereoInChannels{-1};
+  std::atomic<int> mRequestedStereoOutChannels{-1};
   bool mReportLinkAudioChannels = false;
   bool mReportLinkAudioSource = false;
+
+  std::string mConfigPath;
+  bool mNeedsSaveConfig = false;
+  std::chrono::steady_clock::time_point mLastConfigSave{};
 };

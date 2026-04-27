@@ -3,13 +3,35 @@
 #include <OptionParser.h>
 #include <chrono>
 #include <csignal>
+#include <filesystem>
+#include <fstream>
 #include <thread>
 
 #include <ip/UdpSocket.h>
+#include <nlohmann/json.hpp>
 #include <osc/OscPacketListener.h>
 #include <osc/OscReceivedElements.h>
 
 #include <iostream>
+
+static std::string defaultConfigPath() {
+  namespace fs = std::filesystem;
+  const char* xdg = std::getenv("XDG_CONFIG_HOME");
+  fs::path base = xdg ? fs::path(xdg)
+                      : fs::path(std::getenv("HOME")) / ".config";
+  return (base / "jack-transport-link" / "config.json").string();
+}
+
+static nlohmann::json loadConfig(const std::string& path) {
+  std::ifstream f(path);
+  if (!f.is_open()) return nlohmann::json::object();
+  try {
+    return nlohmann::json::parse(f);
+  } catch (...) {
+    std::cerr << "warning: failed to parse config " << path << ", ignoring\n";
+    return nlohmann::json::object();
+  }
+}
 
 // TODO windows?
 std::atomic<bool> run = true;
@@ -100,6 +122,12 @@ int main(int argc, char *argv[]) {
       .dest("oscport")
       .set_default("-1");
 
+  parser.add_option("-c", "--config")
+      .type("string")
+      .dest("config")
+      .set_default("")
+      .help("path to config file (default: ~/.config/jack-transport-link/config.json)");
+
   parser.add_option("-A", "--no-link-audio")
       .action("store_false")
       .dest("link_audio")
@@ -133,16 +161,40 @@ int main(int argc, char *argv[]) {
   std::chrono::duration serverPollPeriod =
       std::chrono::seconds((long)options.get("poll_seconds"));
 
-  bool enableStartStopSync = options.get("start_stop_sync");
-  double initialBPM = options.get("bpm");
-  double initialQuantum = options.get("quantum");
-  float initialTimeSigDenom = options.get("denom");
-  double initialTicksPerBeat = options.get("ticks");
+  std::string configPath = options.is_set_by_user("config")
+      ? options["config"] : defaultConfigPath();
+  auto cfg = loadConfig(configPath);
+
+  auto cfgDouble = [&](const char* key, double fallback) -> double {
+    return options.is_set_by_user(key) ? (double)options.get(key)
+                                       : cfg.value(key, (double)options.get(key));
+  };
+
+  bool enableStartStopSync = options.is_set_by_user("start_stop_sync")
+      ? (bool)options.get("start_stop_sync")
+      : cfg.value("start_stop_sync", (bool)options.get("start_stop_sync"));
+  double initialBPM        = cfgDouble("bpm",     100.0);
+  double initialQuantum    = cfgDouble("quantum",   4.0);
+  float  initialTimeSigDenom = options.is_set_by_user("denom")
+      ? (float)(double)options.get("denom")
+      : (float)cfg.value("time_sig_denom", (double)options.get("denom"));
+  double initialTicksPerBeat = options.is_set_by_user("ticks")
+      ? (double)options.get("ticks")
+      : cfg.value("ticks_per_beat", (double)options.get("ticks"));
   std::string name = options["name"];
   int oscport = options.get("oscport");
-  bool enableLinkAudio = static_cast<bool>(options.get("link_audio"));
-  size_t linkAudioInChannels = static_cast<size_t>(static_cast<int>(options.get("link_audio_in_stereo_channels")));
-  size_t linkAudioOutChannels = static_cast<size_t>(static_cast<int>(options.get("link_audio_out_stereo_channels")));
+  bool enableLinkAudio = options.is_set_by_user("link_audio")
+      ? static_cast<bool>(options.get("link_audio"))
+      : cfg.value("link_audio_enabled", static_cast<bool>(options.get("link_audio")));
+  size_t linkAudioInChannels = options.is_set_by_user("link_audio_in_stereo_channels")
+      ? static_cast<size_t>(static_cast<int>(options.get("link_audio_in_stereo_channels")))
+      : static_cast<size_t>(cfg.value("in_stereo_channels",
+            static_cast<int>(options.get("link_audio_in_stereo_channels"))));
+  size_t linkAudioOutChannels = options.is_set_by_user("link_audio_out_stereo_channels")
+      ? static_cast<size_t>(static_cast<int>(options.get("link_audio_out_stereo_channels")))
+      : static_cast<size_t>(cfg.value("out_stereo_channels",
+            static_cast<int>(options.get("link_audio_out_stereo_channels"))));
+  bool initialSyncLink = cfg.value("sync", true);
 
   if (initialBPM <= 0.0 || initialQuantum < 1.0 || initialTimeSigDenom < 1.0 ||
       initialTicksPerBeat < 1.0) {
@@ -161,7 +213,10 @@ int main(int argc, char *argv[]) {
                           initialQuantum, initialTimeSigDenom,
                           initialTicksPerBeat,
                           enableLinkAudio, linkAudioInChannels,
-                          linkAudioOutChannels);
+                          linkAudioOutChannels,
+                          initialSyncLink, configPath);
+      if (cfg.contains("source_filters"))
+        j.applySourceFiltersFromConfig(cfg["source_filters"].dump());
 
       if (oscport > 0) {
         try {
