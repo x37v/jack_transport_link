@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -134,7 +135,8 @@ private:
   bool mLinkAudioEnabled = false;
 
   // Per-receiver source filters — written from property/OSC callbacks, read in processEvents.
-  // An object sets index 0; an array sets each index by position. Empty string = any (auto).
+  // Empty string = any (auto). Guarded by mSourceFilterMutex.
+  mutable std::mutex mSourceFilterMutex;
   std::vector<std::string> mLinkAudioPeerFilters;
   std::vector<std::string> mLinkAudioChannelFilters;
   // Per-renderer connection state

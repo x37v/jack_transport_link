@@ -781,7 +781,12 @@ void JackTransportLink::propertyChangeCallback(jack_uuid_t subject,
         mNeedsSaveConfig = true;
       } else if (mLinkAudioEnabled && islinkaudiosource &&
                  get_property(mJackClientUUID, linkaudio_source_key, values, types)) {
-        if (parseLinkAudioSourceFilters(values, mLinkAudioPeerFilters, mLinkAudioChannelFilters)) {
+        bool ok;
+        {
+          std::lock_guard<std::mutex> lock(mSourceFilterMutex);
+          ok = parseLinkAudioSourceFilters(values, mLinkAudioPeerFilters, mLinkAudioChannelFilters);
+        }
+        if (ok) {
           mNeedsSourceUpdate.store(true, std::memory_order_release);
           mNeedsSaveConfig = true;
         }
@@ -793,8 +798,11 @@ void JackTransportLink::propertyChangeCallback(jack_uuid_t subject,
             auto j = nlohmann::json::parse(values);
             if (j.is_object()) {
               const size_t i = static_cast<size_t>(linkaudiosourceidx);
-              mLinkAudioPeerFilters[i]    = j.value("peer",    "");
-              mLinkAudioChannelFilters[i] = j.value("channel", "");
+              {
+                std::lock_guard<std::mutex> lock(mSourceFilterMutex);
+                mLinkAudioPeerFilters[i]    = j.value("peer",    "");
+                mLinkAudioChannelFilters[i] = j.value("channel", "");
+              }
               mNeedsSourceUpdate.store(true, std::memory_order_release);
               mNeedsSaveConfig = true;
             }
@@ -915,9 +923,17 @@ bool JackTransportLink::updateLinkAudioSource() {
   auto channels = mLink.channels();
   bool anyChanged = false;
 
+  // Copy filters under the lock so we don't hold it during the channel search.
+  std::vector<std::string> peerFilters, channelFilters;
+  {
+    std::lock_guard<std::mutex> lock(mSourceFilterMutex);
+    peerFilters    = mLinkAudioPeerFilters;
+    channelFilters = mLinkAudioChannelFilters;
+  }
+
   for (size_t i = 0; i < mRecvRenderers.size(); ++i) {
-    const auto peerNeedle    = toLower(mLinkAudioPeerFilters[i]);
-    const auto channelNeedle = toLower(mLinkAudioChannelFilters[i]);
+    const auto peerNeedle    = toLower(peerFilters[i]);
+    const auto channelNeedle = toLower(channelFilters[i]);
 
     std::optional<ableton::LinkAudio::Channel> target;
     for (const auto& ch : channels) {
@@ -1017,13 +1033,16 @@ void JackTransportLink::ProcessMessage(
                std::strcmp("/jacklink/linkaudio/source", m.AddressPattern()) == 0) {
       // pairs: peer0 channel0 peer1 channel1 ...
       bool changed = false;
-      for (size_t i = 0; i < mRecvRenderers.size() && arg != m.ArgumentsEnd(); ++i) {
-        if (!arg->IsString()) break;
-        mLinkAudioPeerFilters[i] = arg->AsStringUnchecked();
-        ++arg;
-        mLinkAudioChannelFilters[i] = (arg != m.ArgumentsEnd() && arg->IsString())
-            ? (arg++)->AsStringUnchecked() : "";
-        changed = true;
+      {
+        std::lock_guard<std::mutex> lock(mSourceFilterMutex);
+        for (size_t i = 0; i < mRecvRenderers.size() && arg != m.ArgumentsEnd(); ++i) {
+          if (!arg->IsString()) break;
+          mLinkAudioPeerFilters[i] = arg->AsStringUnchecked();
+          ++arg;
+          mLinkAudioChannelFilters[i] = (arg != m.ArgumentsEnd() && arg->IsString())
+              ? (arg++)->AsStringUnchecked() : "";
+          changed = true;
+        }
       }
       if (changed) {
         mNeedsSourceUpdate.store(true, std::memory_order_release);
@@ -1039,10 +1058,13 @@ void JackTransportLink::ProcessMessage(
           && static_cast<size_t>(idx) < mRecvRenderers.size()
           && arg != m.ArgumentsEnd() && arg->IsString()) {
         const size_t i = static_cast<size_t>(idx);
-        mLinkAudioPeerFilters[i] = arg->AsStringUnchecked();
-        ++arg;
-        mLinkAudioChannelFilters[i] = (arg != m.ArgumentsEnd() && arg->IsString())
-            ? arg->AsStringUnchecked() : "";
+        {
+          std::lock_guard<std::mutex> lock(mSourceFilterMutex);
+          mLinkAudioPeerFilters[i] = arg->AsStringUnchecked();
+          ++arg;
+          mLinkAudioChannelFilters[i] = (arg != m.ArgumentsEnd() && arg->IsString())
+              ? arg->AsStringUnchecked() : "";
+        }
         mNeedsSourceUpdate.store(true, std::memory_order_release);
         mNeedsSaveConfig = true;
       }
@@ -1135,8 +1157,11 @@ void JackTransportLink::rebuildAudioPorts(size_t newIn, size_t newOut) {
   }
 
   // Resize per-receiver tracking vectors
-  mLinkAudioPeerFilters.resize(newOut);
-  mLinkAudioChannelFilters.resize(newOut);
+  {
+    std::lock_guard<std::mutex> lock(mSourceFilterMutex);
+    mLinkAudioPeerFilters.resize(newOut);
+    mLinkAudioChannelFilters.resize(newOut);
+  }
   mCurrentSourceChannelIds.resize(newOut);
   mCurrentSourcePeerNames.resize(newOut);
   mCurrentSourceChannelNames.resize(newOut);
