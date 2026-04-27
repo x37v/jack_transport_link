@@ -19,6 +19,8 @@
 
 #define MIDI_PPQ 24
 
+static constexpr int kMaxLinkAudioStereoPairs = 64;
+
 namespace {
 const char *decimal_type = "https://www.w3.org/2001/XMLSchema#decimal";
 const char *int_type = "https://www.w3.org/2001/XMLSchema#integer";
@@ -288,9 +290,9 @@ void JackTransportLink::processEvents() {
   {
     int reqIn  = mRequestedStereoInChannels.exchange(-1, std::memory_order_acq_rel);
     int reqOut = mRequestedStereoOutChannels.exchange(-1, std::memory_order_acq_rel);
-    if (reqIn > 0 || reqOut > 0) {
-      size_t newIn  = reqIn  > 0 ? static_cast<size_t>(reqIn)  : mNumStereoInChannels;
-      size_t newOut = reqOut > 0 ? static_cast<size_t>(reqOut) : mNumStereoOutChannels;
+    if (reqIn >= 0 || reqOut >= 0) {
+      size_t newIn  = reqIn  >= 0 ? static_cast<size_t>(reqIn)  : mNumStereoInChannels;
+      size_t newOut = reqOut >= 0 ? static_cast<size_t>(reqOut) : mNumStereoOutChannels;
       rebuildAudioPorts(newIn, newOut);
     }
   }
@@ -801,14 +803,16 @@ void JackTransportLink::propertyChangeCallback(jack_uuid_t subject,
       } else if (mLinkAudioEnabled && is_in_stereo &&
                  get_property(mJackClientUUID, linkaudio_in_stereo_key, values, types)) {
         char* end;
+        errno = 0;
         long n = std::strtol(values.c_str(), &end, 10);
-        if (*end == '\0' && n >= 1)
+        if (*end == '\0' && errno == 0 && n >= 0 && n <= kMaxLinkAudioStereoPairs)
           mRequestedStereoInChannels.store(static_cast<int>(n));
       } else if (mLinkAudioEnabled && is_out_stereo &&
                  get_property(mJackClientUUID, linkaudio_out_stereo_key, values, types)) {
         char* end;
+        errno = 0;
         long n = std::strtol(values.c_str(), &end, 10);
-        if (*end == '\0' && n >= 1)
+        if (*end == '\0' && errno == 0 && n >= 0 && n <= kMaxLinkAudioStereoPairs)
           mRequestedStereoOutChannels.store(static_cast<int>(n));
       }
     } else if (change == jack_property_change_t::PropertyDeleted) {
@@ -1042,14 +1046,14 @@ void JackTransportLink::ProcessMessage(
                std::strcmp("/jacklink/linkaudio/in-stereo-channels", m.AddressPattern()) == 0) {
       if (arg != m.ArgumentsEnd()) {
         auto v = GetOscDouble(*arg);
-        if (v && *v >= 1.0)
+        if (v && *v >= 0.0 && *v <= kMaxLinkAudioStereoPairs)
           mRequestedStereoInChannels.store(static_cast<int>(*v));
       }
     } else if (mLinkAudioEnabled &&
                std::strcmp("/jacklink/linkaudio/out-stereo-channels", m.AddressPattern()) == 0) {
       if (arg != m.ArgumentsEnd()) {
         auto v = GetOscDouble(*arg);
-        if (v && *v >= 1.0)
+        if (v && *v >= 0.0 && *v <= kMaxLinkAudioStereoPairs)
           mRequestedStereoOutChannels.store(static_cast<int>(*v));
       }
     }

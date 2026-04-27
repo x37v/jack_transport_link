@@ -143,7 +143,7 @@ int main(int argc, char *argv[]) {
   parser.add_option("--link-audio-out-stereo-channels")
       .type("int")
       .dest("link_audio_out_stereo_channels")
-      .set_default("1")
+      .set_default("0")
       .help("Number of Link Audio stereo receive pairs, default: %default.");
 
   // process args

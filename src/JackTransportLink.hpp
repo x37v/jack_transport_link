@@ -34,7 +34,7 @@ public:
                     double initialTicksPerBeat = 1920.,
                     bool enableLinkAudio = true,
                     size_t linkAudioStereoInChannels = 1,
-                    size_t linkAudioStereoOutChannels = 1,
+                    size_t linkAudioStereoOutChannels = 0,
                     bool syncLink = true,
                     std::string configPath = "");
   ~JackTransportLink();
