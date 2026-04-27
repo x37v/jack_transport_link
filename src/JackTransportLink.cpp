@@ -1015,12 +1015,19 @@ void JackTransportLink::ProcessMessage(
       }
     } else if (mLinkAudioEnabled &&
                std::strcmp("/jacklink/linkaudio/source", m.AddressPattern()) == 0) {
-      if (arg != m.ArgumentsEnd() && arg->IsString()) {
-        std::string v = arg->AsStringUnchecked();
-        if (parseLinkAudioSourceFilters(v, mLinkAudioPeerFilters, mLinkAudioChannelFilters)) {
-          mNeedsSourceUpdate.store(true, std::memory_order_release);
-          mNeedsSaveConfig = true;
-        }
+      // pairs: peer0 channel0 peer1 channel1 ...
+      bool changed = false;
+      for (size_t i = 0; i < mRecvRenderers.size() && arg != m.ArgumentsEnd(); ++i) {
+        if (!arg->IsString()) break;
+        mLinkAudioPeerFilters[i] = arg->AsStringUnchecked();
+        ++arg;
+        mLinkAudioChannelFilters[i] = (arg != m.ArgumentsEnd() && arg->IsString())
+            ? (arg++)->AsStringUnchecked() : "";
+        changed = true;
+      }
+      if (changed) {
+        mNeedsSourceUpdate.store(true, std::memory_order_release);
+        mNeedsSaveConfig = true;
       }
     } else if (mLinkAudioEnabled
                && std::strncmp("/jacklink/linkaudio/source/", m.AddressPattern(),
@@ -1031,16 +1038,13 @@ void JackTransportLink::ProcessMessage(
       if (*end == '\0' && idx >= 0
           && static_cast<size_t>(idx) < mRecvRenderers.size()
           && arg != m.ArgumentsEnd() && arg->IsString()) {
-        try {
-          auto j = nlohmann::json::parse(arg->AsStringUnchecked());
-          if (j.is_object()) {
-            const size_t i = static_cast<size_t>(idx);
-            mLinkAudioPeerFilters[i]    = j.value("peer",    "");
-            mLinkAudioChannelFilters[i] = j.value("channel", "");
-            mNeedsSourceUpdate.store(true, std::memory_order_release);
-            mNeedsSaveConfig = true;
-          }
-        } catch (...) {}
+        const size_t i = static_cast<size_t>(idx);
+        mLinkAudioPeerFilters[i] = arg->AsStringUnchecked();
+        ++arg;
+        mLinkAudioChannelFilters[i] = (arg != m.ArgumentsEnd() && arg->IsString())
+            ? arg->AsStringUnchecked() : "";
+        mNeedsSourceUpdate.store(true, std::memory_order_release);
+        mNeedsSaveConfig = true;
       }
     } else if (mLinkAudioEnabled &&
                std::strcmp("/jacklink/linkaudio/in-stereo-channels", m.AddressPattern()) == 0) {

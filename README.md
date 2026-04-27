@@ -93,8 +93,8 @@ Pass `-o <port>` to enable the OSC listener. All messages are sent to that UDP p
 | `/jacklink/beattime` | `float` or `double` | Seek the transport to the given beat position. |
 | `/jacklink/sync` | `bool` | Enable (`true`) or disable (`false`) Link sync. |
 | `/jacklink/rolling` | `bool` | Start (`true`) or stop (`false`) the transport. |
-| `/jacklink/linkaudio/source` | `string` (JSON) | Set source filter for all receivers (object or array). See [Link Audio](#link-audio). |
-| `/jacklink/linkaudio/source/<N>` | `string` (JSON object) | Set source filter for receiver N (zero-based). |
+| `/jacklink/linkaudio/source` | `string string [string string ...]` | Set source filters as peer/channel pairs: `peer0 channel0 peer1 channel1 …`. See [Link Audio](#link-audio). |
+| `/jacklink/linkaudio/source/<N>` | `string string` | Set source filter for receiver N as a peer/channel pair. |
 | `/jacklink/linkaudio/in-stereo-channels` | `int` | Change the number of stereo send pairs at runtime. |
 | `/jacklink/linkaudio/out-stereo-channels` | `int` | Change the number of stereo receive pairs at runtime. |
 
@@ -108,14 +108,16 @@ Each stereo receive pair (configurable with `--link-audio-out-stereo-channels`, 
 
 ### Selecting a source
 
-By default the first available peer is subscribed automatically. To select a specific peer, set the `linkaudio/source` Jack metadata property or send an OSC message to `/jacklink/linkaudio/source`.
+By default the first available peer is subscribed automatically. To select a specific peer, set the `linkaudio/source` JACK metadata property or send an OSC message to `/jacklink/linkaudio/source`.
 
-The value is either a **single JSON object** (sets receiver 0 only) or a **JSON array** (sets each receiver by index). Each element is a `{"peer":"…","channel":"…"}` filter — both fields are case-insensitive substring matches and either can be omitted. `{}` reverts that receiver to auto-selection.
+#### JACK metadata (JSON)
+
+The property value is either a **single JSON object** (sets receiver 0 only) or a **JSON array** (sets each receiver by index). Each element is a `{"peer":"…","channel":"…"}` filter — both fields are case-insensitive substring matches and either can be omitted. `{}` reverts that receiver to auto-selection.
 
 The property always reflects the current connection state as a JSON array, one entry per receive pair — `{}` for any receiver with no active source.
 
 ```shell
-# Set receiver 0 only (indexed property — single object)
+# Set receiver 0 only
 jack_property --client jack-transport-link \
   http://www.x37v.info/jack/metadata/linkaudio/source/0 \
   '{"peer":"Push"}' application/json
@@ -125,7 +127,7 @@ jack_property --client jack-transport-link \
   http://www.x37v.info/jack/metadata/linkaudio/source/1 \
   '{"peer":"Alex","channel":"Cue"}' application/json
 
-# Set all receivers at once (array form on the base property)
+# Set all receivers at once (array form)
 jack_property --client jack-transport-link \
   http://www.x37v.info/jack/metadata/linkaudio/source \
   '[{"peer":"Push"},{"peer":"Alex"}]' application/json
@@ -139,14 +141,23 @@ jack_property --client jack-transport-link \
 jack_property --client jack-transport-link --list \
   http://www.x37v.info/jack/metadata/linkaudio/source
 
-# Read the current connection for receiver 0
-jack_property --client jack-transport-link --list \
-  http://www.x37v.info/jack/metadata/linkaudio/source/0
-
 # List available channels
 jack_property --client jack-transport-link --list \
   http://www.x37v.info/jack/metadata/linkaudio/channels
 ```
+
+#### OSC (string pairs)
+
+OSC source messages use flat string pairs — `peer channel` — rather than JSON.
+
+```
+# Set receiver 0: /jacklink/linkaudio/source/0  "Push" ""
+# Set receiver 1: /jacklink/linkaudio/source/1  "Alex" "Cue"
+# Set all at once: /jacklink/linkaudio/source  "Push" "" "Alex" "Cue"
+# Revert receiver 0 to auto: /jacklink/linkaudio/source/0  "" ""
+```
+
+Empty strings match any peer or channel (auto-selection).
 
 The `linkaudio/in-stereo-channels` and `linkaudio/out-stereo-channels` properties (integer type) can be written to change the number of stereo pairs at runtime:
 
