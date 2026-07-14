@@ -34,6 +34,23 @@ const std::string
 const std::string
     linkaudio_source_key("http://www.x37v.info/jack/metadata/linkaudio/source");
 const std::string
+    linkaudio_sink_key("http://www.x37v.info/jack/metadata/linkaudio/sink");
+const std::string
+    linkaudio_source_filters_key("http://www.x37v.info/jack/metadata/linkaudio/source-filters");
+// Currently-connected peer/channel per source, published here (not on the source key)
+// so our own status publishing doesn't feed back into the desired-filter parsing.
+const std::string
+    linkaudio_source_status_key("http://www.x37v.info/jack/metadata/linkaudio/source-status");
+const char *string_type = "text/plain";
+// JACK's standard port presentation metadata (grouping + display name), set on our own
+// audio ports so patchbays (e.g. the RNBO runner's graph editor) group and label them.
+const std::string port_group_key(JACK_METADATA_PORT_GROUP);
+const std::string pretty_name_key(JACK_METADATA_PRETTY_NAME);
+const std::string order_key(JACK_METADATA_ORDER);
+const char *link_audio_port_group = "jack-link-audio";
+// JACK recommends this type for the order key; it also matches what the RNBO runner parses.
+const char *order_type = "http://www.w3.org/2001/XMLSchema#int";
+const std::string
     linkaudio_channels_key("http://www.x37v.info/jack/metadata/linkaudio/channels");
 const std::string
     linkaudio_in_stereo_key("http://www.x37v.info/jack/metadata/linkaudio/in-stereo-channels");
@@ -123,6 +140,33 @@ int linkAudioSourceIndex(const char* key) {
   return static_cast<int>(idx);
 }
 
+// Returns the slot index from a key of the form base + "/<N>/name", else -1.
+// base is linkaudio_source_key or linkaudio_sink_key.
+int linkAudioNameIndex(const char* key, const std::string& base) {
+  if (!key) return -1;
+  const size_t blen = base.size();
+  if (std::strncmp(key, base.c_str(), blen) != 0) return -1;
+  if (key[blen] != '/') return -1;
+  const char* idxStr = key + blen + 1;
+  char* end;
+  long idx = std::strtol(idxStr, &end, 10);
+  if (end == idxStr || idx < 0) return -1;
+  if (std::strcmp(end, "/name") != 0) return -1;
+  return static_cast<int>(idx);
+}
+
+// Parse "<prefix><N><suffix>" OSC addresses, returning N (>=0), else -1.
+long parseOscNameIndex(const char* address, const char* prefix, const char* suffix) {
+  const size_t plen = std::strlen(prefix);
+  if (std::strncmp(address, prefix, plen) != 0) return -1;
+  const char* idxStr = address + plen;
+  char* end;
+  long idx = std::strtol(idxStr, &end, 10);
+  if (end == idxStr || idx < 0) return -1;
+  if (std::strcmp(end, suffix) != 0) return -1;
+  return idx;
+}
+
 } // namespace
 
 JackTransportLink::JackTransportLink(jack_client_t *client,
@@ -134,7 +178,9 @@ JackTransportLink::JackTransportLink(jack_client_t *client,
                                      size_t linkAudioStereoInChannels,
                                      size_t linkAudioStereoOutChannels,
                                      bool syncLink,
-                                     std::string configPath)
+                                     std::string configPath,
+                                     std::vector<std::string> sinkNames,
+                                     std::vector<std::string> sourceNames)
     : mJackClient(client),
       mSampleRate(static_cast<double>(jack_get_sample_rate(client))),
       mNumStereoInChannels(linkAudioStereoInChannels),
@@ -147,7 +193,9 @@ JackTransportLink::JackTransportLink(jack_client_t *client,
       mJackClientUUID(0),
       mSyncLink(syncLink),
       mWasSyncLink(syncLink),
-      mConfigPath(std::move(configPath)) {
+      mConfigPath(std::move(configPath)),
+      mSinkNames(std::move(sinkNames)),
+      mSourceNames(std::move(sourceNames)) {
   // setup listener
 
   // setup link
@@ -209,9 +257,14 @@ JackTransportLink::JackTransportLink(jack_client_t *client,
 
   mLinkAudioEnabled = enableLinkAudio;
   if (mLinkAudioEnabled) {
-    for (size_t i = 0; i < mNumStereoInChannels; ++i)
+    mSinkNames.resize(mNumStereoInChannels);
+    mSourceNames.resize(mNumStereoOutChannels);
+    mAppliedSinkNames.resize(mNumStereoInChannels);
+    for (size_t i = 0; i < mNumStereoInChannels; ++i) {
+      mAppliedSinkNames[i] = effectiveSinkName(i);
       mSendRenderers.push_back(std::make_unique<SinkRenderer>(
-          mLink, "Send " + std::to_string(i + 1), 2, mSampleRate));
+          mLink, mAppliedSinkNames[i], 2, mSampleRate));
+    }
     for (size_t i = 0; i < mNumStereoOutChannels; ++i)
       mRecvRenderers.push_back(std::make_unique<SourceRenderer>(
           mLink, 2, mSampleRate));
@@ -255,10 +308,16 @@ JackTransportLink::JackTransportLink(jack_client_t *client,
   }
   if (mLinkAudioEnabled && !jack_uuid_empty(mJackClientUUID)) {
     setLinkAudioSourceProperty();
+    setLinkAudioSourceFiltersProperty();
     setLinkAudioChannelsProperty({});
     setLinkAudioInStereoChannelsProperty(mNumStereoInChannels);
     setLinkAudioOutStereoChannelsProperty(mNumStereoOutChannels);
+    for (size_t i = 0; i < mNumStereoInChannels; ++i)
+      setLinkAudioSinkNameProperty(i);
+    for (size_t i = 0; i < mNumStereoOutChannels; ++i)
+      setLinkAudioSourceNameProperty(i);
   }
+  updateAudioPortMetadata();
 
   // setup jack, become the timebase master, unconditionally
   jack_set_process_callback(mJackClient, JackTransportLink::processCallback,
@@ -297,12 +356,15 @@ void JackTransportLink::processEvents() {
     }
   }
   if (mLinkAudioEnabled) {
+    if (mNeedsApplySinkNames.exchange(false, std::memory_order_acq_rel)) {
+      applySinkNames();
+    }
     if (mChannelsChanged.exchange(false, std::memory_order_acq_rel)) {
-      if (updateLinkAudioSource()) mReportLinkAudioSource = true;
+      if (updateLinkAudioSource()) { mReportLinkAudioSource = true; mUpdatePortMeta = true; }
       mReportLinkAudioChannels = true;
     }
     if (mNeedsSourceUpdate.exchange(false, std::memory_order_acq_rel)) {
-      if (updateLinkAudioSource()) mReportLinkAudioSource = true;
+      if (updateLinkAudioSource()) { mReportLinkAudioSource = true; mUpdatePortMeta = true; }
     }
     if (mReportLinkAudioChannels) {
       mReportLinkAudioChannels = false;
@@ -311,6 +373,16 @@ void JackTransportLink::processEvents() {
     if (mReportLinkAudioSource) {
       mReportLinkAudioSource = false;
       setLinkAudioSourceProperty();
+    }
+    if (mReportLinkAudioSourceFilters) {
+      mReportLinkAudioSourceFilters = false;
+      setLinkAudioSourceFiltersProperty();
+      // the configured filter is the fallback source label, so refresh port names too
+      mUpdatePortMeta = true;
+    }
+    if (mUpdatePortMeta) {
+      mUpdatePortMeta = false;
+      updateAudioPortMetadata();
     }
   }
   if (mReportBPM) {
@@ -750,7 +822,13 @@ void JackTransportLink::propertyChangeCallback(jack_uuid_t subject,
     bool is_in_stereo  = !key || linkaudio_in_stereo_key.compare(key) == 0;
     bool is_out_stereo = !key || linkaudio_out_stereo_key.compare(key) == 0;
     int  linkaudiosourceidx = key ? linkAudioSourceIndex(key) : -1;
-    if (change == jack_property_change_t::PropertyChanged) {
+    int  srcNameIdx  = key ? linkAudioNameIndex(key, linkaudio_source_key) : -1;
+    int  sinkNameIdx = key ? linkAudioNameIndex(key, linkaudio_sink_key) : -1;
+    // Treat a newly-created property the same as a changed one. Properties that
+    // jack_transport_link doesn't publish itself (e.g. the optional slot-name keys,
+    // which are absent until first set) arrive as PropertyCreated, not PropertyChanged.
+    if (change == jack_property_change_t::PropertyChanged ||
+        change == jack_property_change_t::PropertyCreated) {
       std::string values;
       std::string types;
       if (isbpm && get_property(mJackClientUUID, bpm_key, values, types)) {
@@ -786,6 +864,7 @@ void JackTransportLink::propertyChangeCallback(jack_uuid_t subject,
         }
         if (ok) {
           mNeedsSourceUpdate.store(true, std::memory_order_release);
+          mReportLinkAudioSourceFilters = true;
           mNeedsSaveConfig = true;
         }
       } else if (mLinkAudioEnabled && linkaudiosourceidx >= 0
@@ -802,9 +881,25 @@ void JackTransportLink::propertyChangeCallback(jack_uuid_t subject,
                 mLinkAudioChannelFilters[i] = j.value("channel", "");
               }
               mNeedsSourceUpdate.store(true, std::memory_order_release);
+              mReportLinkAudioSourceFilters = true;
               mNeedsSaveConfig = true;
             }
           } catch (...) {}
+        }
+      } else if (mLinkAudioEnabled && srcNameIdx >= 0
+                 && static_cast<size_t>(srcNameIdx) < mSourceNames.size()) {
+        const auto nameKey = linkaudio_source_key + "/" + std::to_string(srcNameIdx) + "/name";
+        if (get_property(mJackClientUUID, nameKey, values, types)) {
+          mSourceNames[static_cast<size_t>(srcNameIdx)] = values;
+          mNeedsSaveConfig = true;
+        }
+      } else if (mLinkAudioEnabled && sinkNameIdx >= 0
+                 && static_cast<size_t>(sinkNameIdx) < mSinkNames.size()) {
+        const auto nameKey = linkaudio_sink_key + "/" + std::to_string(sinkNameIdx) + "/name";
+        if (get_property(mJackClientUUID, nameKey, values, types)) {
+          mSinkNames[static_cast<size_t>(sinkNameIdx)] = values;
+          mNeedsApplySinkNames.store(true, std::memory_order_release);
+          mNeedsSaveConfig = true;
         }
       } else if (mLinkAudioEnabled && is_in_stereo &&
                  get_property(mJackClientUUID, linkaudio_in_stereo_key, values, types)) {
@@ -831,9 +926,24 @@ void JackTransportLink::propertyChangeCallback(jack_uuid_t subject,
       if (mLinkAudioEnabled && linkaudiosourceidx >= 0
           && static_cast<size_t>(linkaudiosourceidx) < mRecvRenderers.size()) {
         const size_t i = static_cast<size_t>(linkaudiosourceidx);
-        mLinkAudioPeerFilters[i]    = {};
-        mLinkAudioChannelFilters[i] = {};
+        {
+          std::lock_guard<std::mutex> lock(mSourceFilterMutex);
+          mLinkAudioPeerFilters[i]    = {};
+          mLinkAudioChannelFilters[i] = {};
+        }
         mNeedsSourceUpdate.store(true, std::memory_order_release);
+        mReportLinkAudioSourceFilters = true;
+      }
+      if (mLinkAudioEnabled && srcNameIdx >= 0
+          && static_cast<size_t>(srcNameIdx) < mSourceNames.size()) {
+        mSourceNames[static_cast<size_t>(srcNameIdx)] = {};
+        mNeedsSaveConfig = true;
+      }
+      if (mLinkAudioEnabled && sinkNameIdx >= 0
+          && static_cast<size_t>(sinkNameIdx) < mSinkNames.size()) {
+        mSinkNames[static_cast<size_t>(sinkNameIdx)] = {};
+        mNeedsApplySinkNames.store(true, std::memory_order_release);
+        mNeedsSaveConfig = true;
       }
     }
   }
@@ -894,6 +1004,10 @@ void JackTransportLink::setLinkAudioChannelsProperty(
                     value.c_str(), "application/json");
 }
 
+// Publish the currently-connected peer/channel for each source as an index-aligned
+// array on the dedicated status key. The source key itself is left as a write-only
+// desired-filter target (written by clients, parsed in propertyChangeCallback) so we
+// never re-ingest our own status as a filter.
 void JackTransportLink::setLinkAudioSourceProperty() {
   if (jack_uuid_empty(mJackClientUUID)) return;
   nlohmann::json arr = nlohmann::json::array();
@@ -904,12 +1018,160 @@ void JackTransportLink::setLinkAudioSourceProperty() {
                {"channel", mCurrentSourceChannelNames[i]}};
     }
     arr.push_back(entry);
-    const auto indexKey = linkaudio_source_key + "/" + std::to_string(i);
-    jack_set_property(mJackClient, mJackClientUUID, indexKey.c_str(),
-                      entry.dump().c_str(), "application/json");
   }
-  jack_set_property(mJackClient, mJackClientUUID, linkaudio_source_key.c_str(),
+  jack_set_property(mJackClient, mJackClientUUID, linkaudio_source_status_key.c_str(),
                     arr.dump().c_str(), "application/json");
+}
+
+// Read-only reflection of the *configured* per-source filters (distinct from the
+// current-connection status published by setLinkAudioSourceProperty). Lets readers
+// see what was requested even when no matching peer is online.
+void JackTransportLink::setLinkAudioSourceFiltersProperty() {
+  if (jack_uuid_empty(mJackClientUUID)) return;
+  nlohmann::json arr = nlohmann::json::array();
+  {
+    std::lock_guard<std::mutex> lock(mSourceFilterMutex);
+    for (size_t i = 0; i < mLinkAudioPeerFilters.size(); ++i) {
+      nlohmann::json entry = nlohmann::json::object();
+      if (!mLinkAudioPeerFilters[i].empty())    entry["peer"]    = mLinkAudioPeerFilters[i];
+      if (!mLinkAudioChannelFilters[i].empty()) entry["channel"] = mLinkAudioChannelFilters[i];
+      arr.push_back(entry);
+    }
+  }
+  jack_set_property(mJackClient, mJackClientUUID, linkaudio_source_filters_key.c_str(),
+                    arr.dump().c_str(), "application/json");
+}
+
+std::string JackTransportLink::effectiveSinkName(size_t i) const {
+  if (i < mSinkNames.size() && !mSinkNames[i].empty())
+    return mSinkNames[i];
+  return "Send " + std::to_string(i + 1);
+}
+
+// JACK disallows empty metadata values, so "no custom name" is represented by the
+// property being absent. Only remove it when it actually exists, to avoid jackd
+// logging a DB_NOTFOUND error for a no-op delete.
+void JackTransportLink::setLinkAudioSlotNameProperty(const std::string& key, const std::string& name) {
+  if (jack_uuid_empty(mJackClientUUID)) return;
+  if (name.empty()) {
+    std::string v, t;
+    if (get_property(mJackClientUUID, key, v, t))
+      jack_remove_property(mJackClient, mJackClientUUID, key.c_str());
+  } else {
+    jack_set_property(mJackClient, mJackClientUUID, key.c_str(), name.c_str(), string_type);
+  }
+}
+
+void JackTransportLink::setLinkAudioSinkNameProperty(size_t i) {
+  if (i >= mSinkNames.size()) return;
+  setLinkAudioSlotNameProperty(linkaudio_sink_key + "/" + std::to_string(i) + "/name", mSinkNames[i]);
+}
+
+void JackTransportLink::setLinkAudioSourceNameProperty(size_t i) {
+  if (i >= mSourceNames.size()) return;
+  setLinkAudioSlotNameProperty(linkaudio_source_key + "/" + std::to_string(i) + "/name", mSourceNames[i]);
+}
+
+// Display label for an incoming (source) stereo pair: the currently-connected
+// peer/channel, else the configured filter, else a generic default.
+std::string JackTransportLink::linkAudioSourcePortLabel(size_t i) {
+  auto join = [](const std::string& peer, const std::string& channel) -> std::string {
+    if (peer.size() && channel.size()) return peer + ": " + channel;
+    return peer + channel;
+  };
+  if (i < mCurrentSourceChannelIds.size() && mCurrentSourceChannelIds[i].has_value()) {
+    auto label = join(mCurrentSourcePeerNames[i], mCurrentSourceChannelNames[i]);
+    if (label.size()) return label;
+  }
+  {
+    std::lock_guard<std::mutex> lock(mSourceFilterMutex);
+    if (i < mLinkAudioPeerFilters.size()) {
+      auto label = join(mLinkAudioPeerFilters[i], mLinkAudioChannelFilters[i]);
+      if (label.size()) return label;
+    }
+  }
+  return "Link In " + std::to_string(i + 1);
+}
+
+// Set the port-group + pretty-name on our own audio ports so patchbays present them
+// as a "jack-link-audio" node: sinks (in_N) by their announced name, sources (out_N)
+// by the connected peer/channel. Only writes on change to avoid notification churn.
+// JACK removes this metadata automatically when the ports are unregistered.
+void JackTransportLink::updateAudioPortMetadata() {
+  if (!mLinkAudioEnabled) return;
+  auto setIfChanged = [this](jack_port_t* port, const std::string& key, const std::string& val, const char* type) {
+    if (!port) return;
+    jack_uuid_t u = jack_port_uuid(port);
+    if (jack_uuid_empty(u)) return;
+    std::string cur, t;
+    if (!(get_property(u, key, cur, t) && cur == val))
+      jack_set_property(mJackClient, u, key.c_str(), val.c_str(), type);
+  };
+  // order is a stable per-port index so patchbays keep in_N/out_N in slot order
+  auto decorate = [&](jack_port_t* port, const std::string& pretty, int order) {
+    setIfChanged(port, port_group_key, link_audio_port_group, string_type);
+    setIfChanged(port, pretty_name_key, pretty, string_type);
+    setIfChanged(port, order_key, std::to_string(order), order_type);
+  };
+  for (size_t i = 0; i < mNumStereoInChannels && (i * 2 + 1) < mAudioIns.size(); ++i) {
+    const auto base = effectiveSinkName(i);
+    decorate(mAudioIns[i * 2],     base + " L", static_cast<int>(i * 2 + 1));
+    decorate(mAudioIns[i * 2 + 1], base + " R", static_cast<int>(i * 2 + 2));
+  }
+  for (size_t i = 0; i < mNumStereoOutChannels && (i * 2 + 1) < mAudioOuts.size(); ++i) {
+    const auto base = linkAudioSourcePortLabel(i);
+    decorate(mAudioOuts[i * 2],     base + " L", static_cast<int>(i * 2 + 1));
+    decorate(mAudioOuts[i * 2 + 1], base + " R", static_cast<int>(i * 2 + 2));
+  }
+}
+
+// Recreate any SinkRenderer whose announced name no longer matches its slot's
+// effective name. Recreating a renderer races the RT process callback, so this
+// mirrors rebuildAudioPorts: deactivate, swap, reactivate, restore connections.
+void JackTransportLink::applySinkNames() {
+  if (!mLinkAudioEnabled) return;
+  mAppliedSinkNames.resize(mSendRenderers.size());
+  bool any = false;
+  for (size_t i = 0; i < mSendRenderers.size(); ++i)
+    if (effectiveSinkName(i) != mAppliedSinkNames[i]) { any = true; break; }
+  if (!any) return;
+
+  // jack_deactivate drops ALL of our ports' connections, not just the sinks we're
+  // recreating. Snapshot every connection (inputs, outputs, clock) and restore them,
+  // otherwise e.g. renaming a sink would silently drop the source (out_N) routing.
+  struct Conn { std::string mine; std::string other; bool output; };
+  std::vector<Conn> conns;
+  auto snapshot = [&conns](jack_port_t* port, bool output) {
+    if (!port) return;
+    const char** c = jack_port_get_connections(port);
+    if (c) {
+      const std::string mine = jack_port_name(port);
+      for (const char** p = c; *p; ++p) conns.push_back({mine, *p, output});
+      jack_free(c);
+    }
+  };
+  for (auto* p : mAudioIns)  snapshot(p, false);
+  for (auto* p : mAudioOuts) snapshot(p, true);
+  snapshot(mMIDIClockOut, true);
+
+  jack_deactivate(mJackClient);
+  for (size_t i = 0; i < mSendRenderers.size(); ++i) {
+    const auto name = effectiveSinkName(i);
+    if (name != mAppliedSinkNames[i]) {
+      mSendRenderers[i] = std::make_unique<SinkRenderer>(mLink, name, 2, mSampleRate);
+      mAppliedSinkNames[i] = name;
+    }
+  }
+  jack_activate(mJackClient);
+
+  for (const auto& c : conns) {
+    if (c.output)
+      jack_connect(mJackClient, c.mine.c_str(), c.other.c_str());
+    else
+      jack_connect(mJackClient, c.other.c_str(), c.mine.c_str());
+  }
+
+  mUpdatePortMeta = true;
 }
 
 static std::string toLower(std::string s) {
@@ -929,9 +1191,17 @@ bool JackTransportLink::updateLinkAudioSource() {
     channelFilters = mLinkAudioChannelFilters;
   }
 
+  // channels already taken by a source this pass, so auto (unfiltered) sources don't
+  // all collapse onto the same first-available channel
+  std::vector<ableton::ChannelId> claimed;
+  auto isClaimed = [&claimed](const ableton::ChannelId& id) {
+    return std::find(claimed.begin(), claimed.end(), id) != claimed.end();
+  };
+
   for (size_t i = 0; i < mRecvRenderers.size(); ++i) {
     const auto peerNeedle    = toLower(peerFilters[i]);
     const auto channelNeedle = toLower(channelFilters[i]);
+    const bool isAuto = peerNeedle.empty() && channelNeedle.empty();
 
     std::optional<ableton::LinkAudio::Channel> target;
     for (const auto& ch : channels) {
@@ -939,13 +1209,15 @@ bool JackTransportLink::updateLinkAudioSource() {
                           || toLower(ch.peerName).find(peerNeedle) != std::string::npos;
       bool channelMatch = channelNeedle.empty()
                           || toLower(ch.name).find(channelNeedle) != std::string::npos;
-      if (peerMatch && channelMatch) {
+      // an auto source skips channels another source has already claimed
+      if (peerMatch && channelMatch && !(isAuto && isClaimed(ch.id))) {
         target = ch;
         break;
       }
     }
 
     if (target) {
+      claimed.push_back(target->id);
       bool needSwitch = !mRecvRenderers[i]->hasSource()
           || !mCurrentSourceChannelIds[i].has_value()
           || (*mCurrentSourceChannelIds[i] != target->id);
@@ -1044,6 +1316,26 @@ void JackTransportLink::ProcessMessage(
       }
       if (changed) {
         mNeedsSourceUpdate.store(true, std::memory_order_release);
+        mReportLinkAudioSourceFilters = true;
+        mNeedsSaveConfig = true;
+      }
+    } else if (mLinkAudioEnabled
+               && parseOscNameIndex(m.AddressPattern(), "/jacklink/linkaudio/source/", "/name") >= 0) {
+      long idx = parseOscNameIndex(m.AddressPattern(), "/jacklink/linkaudio/source/", "/name");
+      if (static_cast<size_t>(idx) < mSourceNames.size()
+          && arg != m.ArgumentsEnd() && arg->IsString()) {
+        mSourceNames[static_cast<size_t>(idx)] = arg->AsStringUnchecked();
+        setLinkAudioSourceNameProperty(static_cast<size_t>(idx));
+        mNeedsSaveConfig = true;
+      }
+    } else if (mLinkAudioEnabled
+               && parseOscNameIndex(m.AddressPattern(), "/jacklink/linkaudio/sink/", "/name") >= 0) {
+      long idx = parseOscNameIndex(m.AddressPattern(), "/jacklink/linkaudio/sink/", "/name");
+      if (static_cast<size_t>(idx) < mSinkNames.size()
+          && arg != m.ArgumentsEnd() && arg->IsString()) {
+        mSinkNames[static_cast<size_t>(idx)] = arg->AsStringUnchecked();
+        setLinkAudioSinkNameProperty(static_cast<size_t>(idx));
+        mNeedsApplySinkNames.store(true, std::memory_order_release);
         mNeedsSaveConfig = true;
       }
     } else if (mLinkAudioEnabled
@@ -1064,6 +1356,7 @@ void JackTransportLink::ProcessMessage(
               ? arg->AsStringUnchecked() : "";
         }
         mNeedsSourceUpdate.store(true, std::memory_order_release);
+        mReportLinkAudioSourceFilters = true;
         mNeedsSaveConfig = true;
       }
     } else if (mLinkAudioEnabled &&
@@ -1164,10 +1457,16 @@ void JackTransportLink::rebuildAudioPorts(size_t newIn, size_t newOut) {
   mCurrentSourcePeerNames.resize(newOut);
   mCurrentSourceChannelNames.resize(newOut);
 
+  // Resize per-slot name vectors (preserving surviving slots' names)
+  mSinkNames.resize(newIn);
+  mAppliedSinkNames.resize(newIn);
+  mSourceNames.resize(newOut);
+
   // Grow send side
   for (size_t i = oldIn; i < newIn; ++i) {
+    mAppliedSinkNames[i] = effectiveSinkName(i);
     mSendRenderers.push_back(std::make_unique<SinkRenderer>(
-        mLink, "Send " + std::to_string(i + 1), 2, mSampleRate));
+        mLink, mAppliedSinkNames[i], 2, mSampleRate));
     mAudioIns.push_back(jack_port_register(mJackClient,
         ("in_" + std::to_string(i * 2 + 1)).c_str(),
         JACK_DEFAULT_AUDIO_TYPE, JackPortIsInput | JackPortIsTerminal, 0));
@@ -1211,14 +1510,26 @@ void JackTransportLink::rebuildAudioPorts(size_t newIn, size_t newOut) {
     for (size_t i = newOut; i < oldOut; ++i) {
       const auto key = linkaudio_source_key + "/" + std::to_string(i);
       jack_remove_property(mJackClient, mJackClientUUID, key.c_str());
+      const auto nameKey = linkaudio_source_key + "/" + std::to_string(i) + "/name";
+      jack_remove_property(mJackClient, mJackClientUUID, nameKey.c_str());
+    }
+    for (size_t i = newIn; i < oldIn; ++i) {
+      const auto nameKey = linkaudio_sink_key + "/" + std::to_string(i) + "/name";
+      jack_remove_property(mJackClient, mJackClientUUID, nameKey.c_str());
     }
     setLinkAudioInStereoChannelsProperty(newIn);
     setLinkAudioOutStereoChannelsProperty(newOut);
     setLinkAudioSourceProperty();
+    setLinkAudioSourceFiltersProperty();
     setLinkAudioChannelsProperty(mLink.channels());
+    for (size_t i = 0; i < newIn; ++i)
+      setLinkAudioSinkNameProperty(i);
+    for (size_t i = 0; i < newOut; ++i)
+      setLinkAudioSourceNameProperty(i);
   }
 
   mNeedsSaveConfig = true;
+  mUpdatePortMeta = true; //newly-registered ports need their group/labels
 }
 
 void JackTransportLink::applySourceFiltersFromConfig(const std::string& jsonText) {
@@ -1250,6 +1561,8 @@ void JackTransportLink::saveConfig() {
     filters.push_back(entry);
   }
   cfg["source_filters"] = filters;
+  cfg["sink_names"]     = mSinkNames;
+  cfg["source_names"]   = mSourceNames;
 
   std::ofstream f(mConfigPath);
   if (f.is_open())

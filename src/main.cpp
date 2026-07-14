@@ -196,6 +196,17 @@ int main(int argc, char *argv[]) {
             static_cast<int>(options.get("link_audio_out_stereo_channels"))));
   bool initialSyncLink = cfg.value("sync", true);
 
+  auto loadNames = [&](const char* key) -> std::vector<std::string> {
+    std::vector<std::string> out;
+    if (cfg.contains(key) && cfg[key].is_array()) {
+      for (const auto& v : cfg[key])
+        out.push_back(v.is_string() ? v.get<std::string>() : std::string());
+    }
+    return out;
+  };
+  std::vector<std::string> sinkNames   = loadNames("sink_names");
+  std::vector<std::string> sourceNames = loadNames("source_names");
+
   if (initialBPM <= 0.0 || initialQuantum < 1.0 || initialTimeSigDenom < 1.0 ||
       initialTicksPerBeat < 1.0) {
     std::cerr << "one or more numeric options are out of range" << std::endl;
@@ -214,7 +225,8 @@ int main(int argc, char *argv[]) {
                           initialTicksPerBeat,
                           enableLinkAudio, linkAudioInChannels,
                           linkAudioOutChannels,
-                          initialSyncLink, configPath);
+                          initialSyncLink, configPath,
+                          sinkNames, sourceNames);
       if (cfg.contains("source_filters"))
         j.applySourceFiltersFromConfig(cfg["source_filters"].dump());
 

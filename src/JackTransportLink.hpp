@@ -37,7 +37,9 @@ public:
                     size_t linkAudioStereoInChannels = 1,
                     size_t linkAudioStereoOutChannels = 0,
                     bool syncLink = true,
-                    std::string configPath = "");
+                    std::string configPath = "",
+                    std::vector<std::string> sinkNames = {},
+                    std::vector<std::string> sourceNames = {});
   ~JackTransportLink();
 
   void processEvents();
@@ -71,9 +73,17 @@ private:
   void setNumPeersProperty(size_t peers);
   void setLinkAudioChannelsProperty(const std::vector<ableton::LinkAudio::Channel>& channels);
   void setLinkAudioSourceProperty();
+  void setLinkAudioSourceFiltersProperty();
   void setLinkAudioInStereoChannelsProperty(size_t n);
   void setLinkAudioOutStereoChannelsProperty(size_t n);
+  void setLinkAudioSlotNameProperty(const std::string& key, const std::string& name);
+  void setLinkAudioSinkNameProperty(size_t i);
+  void setLinkAudioSourceNameProperty(size_t i);
   bool updateLinkAudioSource();
+  std::string effectiveSinkName(size_t i) const;
+  std::string linkAudioSourcePortLabel(size_t i);
+  void updateAudioPortMetadata();
+  void applySinkNames();
   void rebuildAudioPorts(size_t newIn, size_t newOut);
   void saveConfig();
 
@@ -148,8 +158,20 @@ private:
   std::atomic<int> mRequestedStereoOutChannels{-1};
   bool mReportLinkAudioChannels = false;
   bool mReportLinkAudioSource = false;
+  bool mReportLinkAudioSourceFilters = false;
 
   std::string mConfigPath;
   bool mNeedsSaveConfig = false;
   std::chrono::steady_clock::time_point mLastConfigSave{};
+
+  // Per-slot user names. Empty = use the default ("Send N" for sinks).
+  // mSinkNames tracks the outgoing (SinkRenderer / in_N) slots, mSourceNames the
+  // incoming (SourceRenderer / out_N) slots. mAppliedSinkNames mirrors the names
+  // the currently-constructed SinkRenderers announce to the Link session.
+  std::vector<std::string> mSinkNames;
+  std::vector<std::string> mSourceNames;
+  std::vector<std::string> mAppliedSinkNames;
+  std::atomic<bool> mNeedsApplySinkNames{false};
+  // set when port labels/grouping need to be (re)applied to our audio ports
+  bool mUpdatePortMeta = false;
 };
