@@ -77,6 +77,7 @@ private:
   void setLinkAudioSourceFiltersProperty();
   void setLinkAudioInStereoChannelsProperty(size_t n);
   void setLinkAudioOutStereoChannelsProperty(size_t n);
+  void removePropertyIfExists(const std::string& key);
   void setLinkAudioSlotNameProperty(const std::string& key, const std::string& name);
   void setLinkAudioSinkNameProperty(size_t i);
   void setLinkAudioSourceNameProperty(size_t i);

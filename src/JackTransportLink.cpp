@@ -1120,15 +1120,22 @@ void JackTransportLink::applyLinkPeerName() {
   setLinkAudioPeerNameProperty();
 }
 
+// jackd logs a "DB_NOTFOUND" error when asked to remove a property that was never set.
+// The per-slot filter/name keys are only ever written by clients (e.g. the runner), so a
+// slot left untouched has no property; guard removal on existence to avoid that log spam.
+void JackTransportLink::removePropertyIfExists(const std::string& key) {
+  if (jack_uuid_empty(mJackClientUUID)) return;
+  std::string v, t;
+  if (get_property(mJackClientUUID, key, v, t))
+    jack_remove_property(mJackClient, mJackClientUUID, key.c_str());
+}
+
 // JACK disallows empty metadata values, so "no custom name" is represented by the
-// property being absent. Only remove it when it actually exists, to avoid jackd
-// logging a DB_NOTFOUND error for a no-op delete.
+// property being absent.
 void JackTransportLink::setLinkAudioSlotNameProperty(const std::string& key, const std::string& name) {
   if (jack_uuid_empty(mJackClientUUID)) return;
   if (name.empty()) {
-    std::string v, t;
-    if (get_property(mJackClientUUID, key, v, t))
-      jack_remove_property(mJackClient, mJackClientUUID, key.c_str());
+    removePropertyIfExists(key);
   } else {
     jack_set_property(mJackClient, mJackClientUUID, key.c_str(), name.c_str(), string_type);
   }
@@ -1588,14 +1595,11 @@ void JackTransportLink::rebuildAudioPorts(size_t newIn, size_t newOut) {
 
   if (!jack_uuid_empty(mJackClientUUID)) {
     for (size_t i = newOut; i < oldOut; ++i) {
-      const auto key = linkaudio_source_key + "/" + std::to_string(i);
-      jack_remove_property(mJackClient, mJackClientUUID, key.c_str());
-      const auto nameKey = linkaudio_source_key + "/" + std::to_string(i) + "/name";
-      jack_remove_property(mJackClient, mJackClientUUID, nameKey.c_str());
+      removePropertyIfExists(linkaudio_source_key + "/" + std::to_string(i));
+      removePropertyIfExists(linkaudio_source_key + "/" + std::to_string(i) + "/name");
     }
     for (size_t i = newIn; i < oldIn; ++i) {
-      const auto nameKey = linkaudio_sink_key + "/" + std::to_string(i) + "/name";
-      jack_remove_property(mJackClient, mJackClientUUID, nameKey.c_str());
+      removePropertyIfExists(linkaudio_sink_key + "/" + std::to_string(i) + "/name");
     }
     setLinkAudioInStereoChannelsProperty(newIn);
     setLinkAudioOutStereoChannelsProperty(newOut);
