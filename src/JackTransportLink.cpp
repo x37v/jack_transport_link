@@ -329,6 +329,10 @@ JackTransportLink::JackTransportLink(jack_client_t *client,
 }
 
 JackTransportLink::~JackTransportLink() {
+  // flush any config change that the debounce in processEvents hasn't written yet,
+  // so a clean exit (e.g. Ctrl-C) doesn't lose recent changes
+  if (mNeedsSaveConfig)
+    saveConfig();
   jack_set_sync_callback(mJackClient, nullptr, nullptr);
   jack_release_timebase(mJackClient);
   jack_deactivate(mJackClient);
