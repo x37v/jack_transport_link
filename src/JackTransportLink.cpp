@@ -1537,8 +1537,13 @@ void JackTransportLink::rebuildAudioPorts(size_t newIn, size_t newOut) {
 }
 
 void JackTransportLink::applySourceFiltersFromConfig(const std::string& jsonText) {
-  if (parseLinkAudioSourceFilters(jsonText, mLinkAudioPeerFilters, mLinkAudioChannelFilters))
+  if (parseLinkAudioSourceFilters(jsonText, mLinkAudioPeerFilters, mLinkAudioChannelFilters)) {
     mNeedsSourceUpdate.store(true, std::memory_order_release);
+    // republish the configured-filter reflection: the constructor already published an
+    // (empty) source-filters before config was loaded, so without this the runner/web
+    // would keep showing "Auto" for filters restored from disk
+    mReportLinkAudioSourceFilters = true;
+  }
 }
 
 void JackTransportLink::saveConfig() {
