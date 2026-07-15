@@ -2,6 +2,7 @@
 
 #include <jack/midiport.h>
 #include <jack/uuid.h>
+#include <unistd.h>
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
@@ -56,6 +57,9 @@ const std::string
     linkaudio_in_stereo_key("http://www.x37v.info/jack/metadata/linkaudio/in-stereo-channels");
 const std::string
     linkaudio_out_stereo_key("http://www.x37v.info/jack/metadata/linkaudio/out-stereo-channels");
+// The local Link peer name broadcast to the session, decoupled from the JACK client name.
+const std::string
+    linkaudio_peer_name_key("http://www.x37v.info/jack/metadata/linkaudio/peer-name");
 const std::array<std::string, 2> true_values = {"true", "1"};
 
 const std::array<uint8_t, 1> midi_clock_buf = {248};
@@ -180,16 +184,20 @@ JackTransportLink::JackTransportLink(jack_client_t *client,
                                      bool syncLink,
                                      std::string configPath,
                                      std::vector<std::string> sinkNames,
-                                     std::vector<std::string> sourceNames)
+                                     std::vector<std::string> sourceNames,
+                                     std::string linkPeerName)
     : mJackClient(client),
       mSampleRate(static_cast<double>(jack_get_sample_rate(client))),
       mNumStereoInChannels(linkAudioStereoInChannels),
       mNumStereoOutChannels(linkAudioStereoOutChannels),
+      mLinkPeerName(std::move(linkPeerName)),
       mBPM(initialBPM), mQuantum(initialQuantum),
       mInitialQuantum(initialQuantum),
       mInitialTimeSigDenom(initialTimeSigDenom),
       mInitialTicksPerBeat(initialTicksPerBeat),
-      mLink(initialBPM, jack_get_client_name(client)),
+      // Link peer name is decoupled from the JACK client name (which stays
+      // "jack-transport-link" for the runner/port-bridge); default to the hostname.
+      mLink(initialBPM, effectiveLinkPeerName()),
       mJackClientUUID(0),
       mSyncLink(syncLink),
       mWasSyncLink(syncLink),
@@ -234,6 +242,9 @@ JackTransportLink::JackTransportLink(jack_client_t *client,
       setEnableStartStopProperty(mLink.isStartStopSyncEnabled());
       setSyncProperty(mSyncLink);
       setNumPeersProperty(mLink.numPeers());
+      // publish the effective Link peer name (always non-empty: override or hostname)
+      mAppliedLinkPeerName = effectiveLinkPeerName();
+      setLinkAudioPeerNameProperty();
       jack_set_property_change_callback(
           mJackClient, JackTransportLink::propertyChangeCallback, this);
     } else {
@@ -388,6 +399,10 @@ void JackTransportLink::processEvents() {
       mUpdatePortMeta = false;
       updateAudioPortMetadata();
     }
+  }
+  // Link peer name applies regardless of Link Audio: Link itself is always enabled.
+  if (mNeedsApplyPeerName.exchange(false, std::memory_order_acq_rel)) {
+    applyLinkPeerName();
   }
   if (mReportBPM) {
     mReportBPM = false;
@@ -823,6 +838,7 @@ void JackTransportLink::propertyChangeCallback(jack_uuid_t subject,
     bool islinksync = !key || linksync_key.compare(key) == 0;
     bool isenable = !key || start_stop_key.compare(key) == 0;
     bool islinkaudiosource = !key || linkaudio_source_key.compare(key) == 0;
+    bool ispeername    = !key || linkaudio_peer_name_key.compare(key) == 0;
     bool is_in_stereo  = !key || linkaudio_in_stereo_key.compare(key) == 0;
     bool is_out_stereo = !key || linkaudio_out_stereo_key.compare(key) == 0;
     int  linkaudiosourceidx = key ? linkAudioSourceIndex(key) : -1;
@@ -859,6 +875,18 @@ void JackTransportLink::propertyChangeCallback(jack_uuid_t subject,
           mReportBPM = true;
         }
         mNeedsSaveConfig = true;
+      } else if (ispeername &&
+                 get_property(mJackClientUUID, linkaudio_peer_name_key, values, types)) {
+        // The published value is the *effective* name (override or hostname), so a
+        // client can display what's broadcast. Only treat a write as a new override
+        // when it differs from the current effective name — that filters out our own
+        // republished value (and a redundant write of the current hostname), which
+        // would otherwise latch the hostname in as an override and break auto mode.
+        if (values != effectiveLinkPeerName()) {
+          mLinkPeerName = values;
+          mNeedsApplyPeerName.store(true, std::memory_order_release);
+          mNeedsSaveConfig = true;
+        }
       } else if (mLinkAudioEnabled && islinkaudiosource &&
                  get_property(mJackClientUUID, linkaudio_source_key, values, types)) {
         bool ok;
@@ -927,6 +955,12 @@ void JackTransportLink::propertyChangeCallback(jack_uuid_t subject,
         mReportStartStopEnable = true;
       if (islinksync)
         mReportLinkSync = true;
+      if (ispeername) {
+        // clearing the property reverts to auto (hostname); republish the effective name
+        mLinkPeerName.clear();
+        mNeedsApplyPeerName.store(true, std::memory_order_release);
+        mNeedsSaveConfig = true;
+      }
       if (mLinkAudioEnabled && linkaudiosourceidx >= 0
           && static_cast<size_t>(linkaudiosourceidx) < mRecvRenderers.size()) {
         const size_t i = static_cast<size_t>(linkaudiosourceidx);
@@ -1050,6 +1084,40 @@ std::string JackTransportLink::effectiveSinkName(size_t i) const {
   if (i < mSinkNames.size() && !mSinkNames[i].empty())
     return mSinkNames[i];
   return "Send " + std::to_string(i + 1);
+}
+
+// Effective Link peer name: the user override if set, otherwise the device hostname.
+// Link truncates names beyond 256 chars; the hostname buffer bounds us well under that.
+std::string JackTransportLink::effectiveLinkPeerName() const {
+  if (!mLinkPeerName.empty())
+    return mLinkPeerName;
+  char host[256];
+  if (gethostname(host, sizeof(host)) == 0) {
+    host[sizeof(host) - 1] = '\0';
+    if (host[0] != '\0')
+      return std::string(host);
+  }
+  // last-resort fallback if the hostname can't be read
+  return "jack-transport-link";
+}
+
+// Publish the effective peer name so a client can display what's actually broadcast.
+void JackTransportLink::setLinkAudioPeerNameProperty() {
+  if (jack_uuid_empty(mJackClientUUID)) return;
+  const auto eff = effectiveLinkPeerName();
+  jack_set_property(mJackClient, mJackClientUUID, linkaudio_peer_name_key.c_str(),
+                    eff.c_str(), string_type);
+}
+
+// Recompute the effective peer name; rename the Link peer only when it changed (setPeerName
+// is thread-safe/non-RT), then always republish so readers reflect the current value.
+void JackTransportLink::applyLinkPeerName() {
+  const auto eff = effectiveLinkPeerName();
+  if (eff != mAppliedLinkPeerName) {
+    mLink.setPeerName(eff);
+    mAppliedLinkPeerName = eff;
+  }
+  setLinkAudioPeerNameProperty();
 }
 
 // JACK disallows empty metadata values, so "no custom name" is represented by the
@@ -1302,6 +1370,14 @@ void JackTransportLink::ProcessMessage(
         } else {
           jack_transport_stop(mJackClient);
         }
+      }
+    } else if (std::strcmp("/jacklink/linkaudio/peer-name", m.AddressPattern()) == 0) {
+      // Non-empty sets the override; empty string clears it (reverts to hostname).
+      // Unlike JACK metadata, OSC can carry an empty string, so we handle it here.
+      if (arg != m.ArgumentsEnd() && arg->IsString()) {
+        mLinkPeerName = arg->AsStringUnchecked();
+        mNeedsApplyPeerName.store(true, std::memory_order_release);
+        mNeedsSaveConfig = true;
       }
     } else if (mLinkAudioEnabled &&
                std::strcmp("/jacklink/linkaudio/source", m.AddressPattern()) == 0) {
@@ -1572,6 +1648,7 @@ void JackTransportLink::saveConfig() {
   cfg["source_filters"] = filters;
   cfg["sink_names"]     = mSinkNames;
   cfg["source_names"]   = mSourceNames;
+  cfg["link_peer_name"] = mLinkPeerName;
 
   std::ofstream f(mConfigPath);
   if (f.is_open())

@@ -115,6 +115,13 @@ int main(int argc, char *argv[]) {
       .action("store")
       .dest("name")
       .set_default("jack-transport-link");
+  parser.add_option("-N", "--link-name")
+      .type("string")
+      .help("the Link peer name to broadcast (identifies this device in Ableton "
+            "Live and to other Link peers); empty uses the hostname, default: %default")
+      .action("store")
+      .dest("link_name")
+      .set_default("");
   parser.add_option("-o", "--osc-port")
       .type("int")
       .help("the name to give to the jack client, default: %default")
@@ -207,6 +214,11 @@ int main(int argc, char *argv[]) {
   std::vector<std::string> sinkNames   = loadNames("sink_names");
   std::vector<std::string> sourceNames = loadNames("source_names");
 
+  // Link peer-name override (empty = auto/hostname): CLI wins over config.
+  std::string linkPeerName = options.is_set_by_user("link_name")
+      ? options["link_name"]
+      : cfg.value("link_peer_name", std::string());
+
   if (initialBPM <= 0.0 || initialQuantum < 1.0 || initialTimeSigDenom < 1.0 ||
       initialTicksPerBeat < 1.0) {
     std::cerr << "one or more numeric options are out of range" << std::endl;
@@ -226,7 +238,7 @@ int main(int argc, char *argv[]) {
                           enableLinkAudio, linkAudioInChannels,
                           linkAudioOutChannels,
                           initialSyncLink, configPath,
-                          sinkNames, sourceNames);
+                          sinkNames, sourceNames, linkPeerName);
       if (cfg.contains("source_filters"))
         j.applySourceFiltersFromConfig(cfg["source_filters"].dump());
 

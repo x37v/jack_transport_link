@@ -39,7 +39,8 @@ public:
                     bool syncLink = true,
                     std::string configPath = "",
                     std::vector<std::string> sinkNames = {},
-                    std::vector<std::string> sourceNames = {});
+                    std::vector<std::string> sourceNames = {},
+                    std::string linkPeerName = "");
   ~JackTransportLink();
 
   void processEvents();
@@ -79,6 +80,11 @@ private:
   void setLinkAudioSlotNameProperty(const std::string& key, const std::string& name);
   void setLinkAudioSinkNameProperty(size_t i);
   void setLinkAudioSourceNameProperty(size_t i);
+  // Effective Link peer name = override (mLinkPeerName, if non-empty) else the hostname.
+  std::string effectiveLinkPeerName() const;
+  // Recompute the effective peer name; if it changed, rename the Link peer and republish.
+  void applyLinkPeerName();
+  void setLinkAudioPeerNameProperty();
   bool updateLinkAudioSource();
   std::string effectiveSinkName(size_t i) const;
   std::string linkAudioSourcePortLabel(size_t i);
@@ -95,6 +101,9 @@ private:
   double mSampleRate;
   size_t mNumStereoInChannels;
   size_t mNumStereoOutChannels;
+  // Link peer-name override (empty = auto/hostname). Declared before mLink because the
+  // constructor seeds mLink's peer name from effectiveLinkPeerName(), which reads it.
+  std::string mLinkPeerName;
   ableton::LinkAudio mLink;
   std::vector<std::unique_ptr<SinkRenderer>> mSendRenderers;    // one per stereo in pair
   std::vector<std::unique_ptr<SourceRenderer>> mRecvRenderers;  // one per stereo out pair
@@ -172,6 +181,10 @@ private:
   std::vector<std::string> mSourceNames;
   std::vector<std::string> mAppliedSinkNames;
   std::atomic<bool> mNeedsApplySinkNames{false};
+  // The effective Link peer name currently announced (mirrors mLink's peer name), so
+  // applyLinkPeerName() only calls setPeerName() when it actually changes.
+  std::string mAppliedLinkPeerName;
+  std::atomic<bool> mNeedsApplyPeerName{false};
   // set when port labels/grouping need to be (re)applied to our audio ports
   bool mUpdatePortMeta = false;
 };
