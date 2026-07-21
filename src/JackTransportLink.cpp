@@ -68,6 +68,9 @@ const std::string
 // Writable receiver playout buffer, in milliseconds (converted to beats at the current tempo).
 const std::string
     linkaudio_latency_key("http://www.x37v.info/jack/metadata/linkaudio/latency");
+// Writable "Sync to Incoming Audio" toggle (apply the streaming playout buffer or not).
+const std::string
+    linkaudio_sync_key("http://www.x37v.info/jack/metadata/linkaudio/sync-to-incoming");
 // Read-only (GET) effective I/O latency actually applied to the beat mapping, in milliseconds,
 // plus the auto-detected-only value (effective = auto + user trim). Published so a client can
 // display what compensation is in effect.
@@ -215,7 +218,8 @@ JackTransportLink::JackTransportLink(jack_client_t *client,
                                      std::string linkPeerName,
                                      double captureLatencyTrimMs,
                                      double playbackLatencyTrimMs,
-                                     double latencyMs)
+                                     double latencyMs,
+                                     bool syncToIncomingAudio)
     : mJackClient(client),
       mSampleRate(static_cast<double>(jack_get_sample_rate(client))),
       mNumStereoInChannels(linkAudioStereoInChannels),
@@ -239,6 +243,7 @@ JackTransportLink::JackTransportLink(jack_client_t *client,
   mCaptureLatencyTrimMs.store(captureLatencyTrimMs, std::memory_order_release);
   mPlaybackLatencyTrimMs.store(playbackLatencyTrimMs, std::memory_order_release);
   mLatencyMs.store(clampLatencyMs(latencyMs), std::memory_order_release);
+  mSyncToIncomingAudio.store(syncToIncomingAudio, std::memory_order_release);
 
   // setup link
   mLink.setTempoCallback([this](double bpm) {
@@ -280,6 +285,7 @@ JackTransportLink::JackTransportLink(jack_client_t *client,
       mAppliedLinkPeerName = effectiveLinkPeerName();
       setLinkAudioPeerNameProperty();
       setLinkAudioLatencyMsProperty();
+      setLinkAudioSyncToIncomingProperty();
       jack_set_property_change_callback(
           mJackClient, JackTransportLink::propertyChangeCallback, this);
     } else {
@@ -530,6 +536,9 @@ void JackTransportLink::processEvents() {
   }
   if (mNeedsPublishLatencyMs.exchange(false, std::memory_order_acq_rel)) {
     setLinkAudioLatencyMsProperty();
+  }
+  if (mNeedsPublishSyncToIncoming.exchange(false, std::memory_order_acq_rel)) {
+    setLinkAudioSyncToIncomingProperty();
   }
   if (mReportBPM) {
     mReportBPM = false;
@@ -857,9 +866,14 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
       double* recvPtrs[2];
       for (size_t ch = 0; ch < 2; ++ch)
         recvPtrs[ch] = mStereoRecvBuf.data() + (i * 2 + ch) * nframes;
+      // "Sync to Incoming Audio" off => no streaming buffer (pass 0ms, so the renderer targets
+      // the output-time beat directly); on => defer by the configured playout buffer.
+      const double effLatencyMs =
+          mSyncToIncomingAudio.load(std::memory_order_acquire)
+              ? mLatencyMs.load(std::memory_order_acquire)
+              : 0.0;
       mRecvRenderers[i]->receive(recvPtrs, nframes, sessionState,
-                                 mSampleRate, recvHostTime, mQuantum,
-                                 mLatencyMs.load(std::memory_order_acquire));
+                                 mSampleRate, recvHostTime, mQuantum, effLatencyMs);
       for (size_t ch = 0; ch < 2; ++ch) {
         auto *outBuf = static_cast<float *>(
             jack_port_get_buffer(mAudioOuts[i * 2 + ch], nframes));
@@ -981,6 +995,7 @@ void JackTransportLink::propertyChangeCallback(jack_uuid_t subject,
     bool islinkaudiosource = !key || linkaudio_source_key.compare(key) == 0;
     bool ispeername    = !key || linkaudio_peer_name_key.compare(key) == 0;
     bool islatency     = !key || linkaudio_latency_key.compare(key) == 0;
+    bool issync        = !key || linkaudio_sync_key.compare(key) == 0;
     bool is_in_stereo  = !key || linkaudio_in_stereo_key.compare(key) == 0;
     bool is_out_stereo = !key || linkaudio_out_stereo_key.compare(key) == 0;
     int  linkaudiosourceidx = key ? linkAudioSourceIndex(key) : -1;
@@ -1048,6 +1063,19 @@ void JackTransportLink::propertyChangeCallback(jack_uuid_t subject,
         // read-back stays consistent even when the sanitized value equals the current one.
         if (values != std::to_string(clamped)) {
           mNeedsPublishLatencyMs.store(true, std::memory_order_release);
+        }
+      } else if (issync &&
+                 get_property(mJackClientUUID, linkaudio_sync_key, values, types)) {
+        const bool set = std::find(true_values.begin(), true_values.end(), values) !=
+                         true_values.end();
+        if (set != mSyncToIncomingAudio.load(std::memory_order_acquire)) {
+          mSyncToIncomingAudio.store(set, std::memory_order_release);
+          mNeedsSaveConfig = true;
+        }
+        // Republish our canonical form unless the metadata already matches it (filters our own
+        // echo; corrects any non-canonical write, e.g. "1"/"0", back to "true"/"false").
+        if (values != std::string(set ? "true" : "false")) {
+          mNeedsPublishSyncToIncoming.store(true, std::memory_order_release);
         }
       } else if (mLinkAudioEnabled && islinkaudiosource &&
                  get_property(mJackClientUUID, linkaudio_source_key, values, types)) {
@@ -1127,6 +1155,12 @@ void JackTransportLink::propertyChangeCallback(jack_uuid_t subject,
         // clearing reverts to the default; republish so clients reflect it
         mLatencyMs.store(100.0, std::memory_order_release);
         mNeedsPublishLatencyMs.store(true, std::memory_order_release);
+        mNeedsSaveConfig = true;
+      }
+      if (issync) {
+        // clearing reverts to the default (on); republish so clients reflect it
+        mSyncToIncomingAudio.store(true, std::memory_order_release);
+        mNeedsPublishSyncToIncoming.store(true, std::memory_order_release);
         mNeedsSaveConfig = true;
       }
       if (mLinkAudioEnabled && linkaudiosourceidx >= 0
@@ -1300,6 +1334,13 @@ void JackTransportLink::setLinkAudioLatencyMsProperty() {
   std::string s = std::to_string(mLatencyMs.load(std::memory_order_acquire));
   jack_set_property(mJackClient, mJackClientUUID, linkaudio_latency_key.c_str(),
                     s.c_str(), decimal_type);
+}
+
+// Publish the current "Sync to Incoming Audio" toggle so a client reflects the applied value.
+void JackTransportLink::setLinkAudioSyncToIncomingProperty() {
+  if (jack_uuid_empty(mJackClientUUID)) return;
+  const char* s = mSyncToIncomingAudio.load(std::memory_order_acquire) ? "true" : "false";
+  jack_set_property(mJackClient, mJackClientUUID, linkaudio_sync_key.c_str(), s, bool_type);
 }
 
 // Recompute the effective peer name; rename the Link peer only when it changed (setPeerName
@@ -1849,6 +1890,7 @@ void JackTransportLink::saveConfig() {
   cfg["link_audio_capture_latency_trim_ms"]  = mCaptureLatencyTrimMs.load(std::memory_order_acquire);
   cfg["link_audio_playback_latency_trim_ms"] = mPlaybackLatencyTrimMs.load(std::memory_order_acquire);
   cfg["link_audio_latency_ms"]               = mLatencyMs.load(std::memory_order_acquire);
+  cfg["link_audio_sync_to_incoming"]         = mSyncToIncomingAudio.load(std::memory_order_acquire);
 
   std::ofstream f(mConfigPath);
   if (f.is_open())

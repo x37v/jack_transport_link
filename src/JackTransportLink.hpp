@@ -43,7 +43,8 @@ public:
                     std::string linkPeerName = "",
                     double captureLatencyTrimMs = 0.0,
                     double playbackLatencyTrimMs = 0.0,
-                    double latencyMs = 100.0);
+                    double latencyMs = 100.0,
+                    bool syncToIncomingAudio = true);
   ~JackTransportLink();
 
   void processEvents();
@@ -89,6 +90,7 @@ private:
   void setLinkAudioSourceProperty();
   void setLinkAudioSourceHealthProperty();
   void setLinkAudioLatencyMsProperty();
+  void setLinkAudioSyncToIncomingProperty();
   void setLinkAudioSourceFiltersProperty();
   void setLinkAudioInStereoChannelsProperty(size_t n);
   void setLinkAudioOutStereoChannelsProperty(size_t n);
@@ -182,6 +184,12 @@ private:
   // Receiver playout buffer in milliseconds (converted to beats at the current tempo in the
   // renderer). Configurable; default 100ms, clamped to [0, 2000].
   std::atomic<double> mLatencyMs{100.0};
+  // "Sync to Incoming Audio" (formerly Ableton's "Monitoring Mode"): when true, the receiver
+  // defers playout by the mLatencyMs streaming buffer to sync to the buffered incoming stream;
+  // when false, no streaming buffer is applied (target the output-time beat directly). Hardware
+  // output-latency compensation is applied either way. Default true. Implemented by passing an
+  // effective latency of mLatencyMs (on) or 0 (off) to the renderer.
+  std::atomic<bool> mSyncToIncomingAudio{true};
   std::atomic<jack_nframes_t> mEffCaptureLatencyFrames{0};
   std::atomic<jack_nframes_t> mEffPlaybackLatencyFrames{0};
   // Set by the latency callback (JACK notification thread) on graph/buffer-size changes; drained
@@ -192,6 +200,8 @@ private:
   // Set when the playout-buffer (mLatencyMs) value changes; drained in processEvents to
   // republish the (possibly clamped/reverted) value off the notification thread.
   std::atomic<bool> mNeedsPublishLatencyMs{false};
+  // Same, for the sync-to-incoming-audio toggle.
+  std::atomic<bool> mNeedsPublishSyncToIncoming{false};
 
   // Per-receiver source filters — written from property/OSC callbacks, read in processEvents.
   // Empty string = any (auto). Guarded by mSourceFilterMutex.

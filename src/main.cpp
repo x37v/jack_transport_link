@@ -174,6 +174,17 @@ int main(int argc, char *argv[]) {
       .help("Link Audio receiver playout buffer in milliseconds (converted to beats at the "
             "current tempo), range 0-2000. default: %default.");
 
+  parser.set_defaults("sync_to_incoming", "1");
+  parser.add_option("--sync-to-incoming")
+      .action("store_true")
+      .dest("sync_to_incoming")
+      .help("Sync to Incoming Audio: defer receive playout by the latency buffer to sync to the "
+            "incoming stream (enabled by default).");
+  parser.add_option("--no-sync-to-incoming")
+      .action("store_false")
+      .dest("sync_to_incoming")
+      .help("Disable Sync to Incoming Audio: apply no streaming playout buffer on receive.");
+
   // process args
   optparse::Values options = parser.parse_args(argc, argv);
   std::vector<std::string> args = parser.args();
@@ -252,6 +263,9 @@ int main(int argc, char *argv[]) {
   double latencyMs = options.is_set_by_user("latency_ms")
       ? (double)options.get("latency_ms")
       : cfg.value("link_audio_latency_ms", (double)options.get("latency_ms"));
+  bool syncToIncomingAudio = options.is_set_by_user("sync_to_incoming")
+      ? (bool)options.get("sync_to_incoming")
+      : cfg.value("link_audio_sync_to_incoming", (bool)options.get("sync_to_incoming"));
 
   if (initialBPM <= 0.0 || initialQuantum < 1.0 || initialTimeSigDenom < 1.0 ||
       initialTicksPerBeat < 1.0) {
@@ -273,7 +287,8 @@ int main(int argc, char *argv[]) {
                           linkAudioOutChannels,
                           initialSyncLink, configPath,
                           sinkNames, sourceNames, linkPeerName,
-                          captureLatencyTrimMs, playbackLatencyTrimMs, latencyMs);
+                          captureLatencyTrimMs, playbackLatencyTrimMs, latencyMs,
+                          syncToIncomingAudio);
       if (cfg.contains("source_filters"))
         j.applySourceFiltersFromConfig(cfg["source_filters"].dump());
 
