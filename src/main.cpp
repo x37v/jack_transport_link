@@ -178,12 +178,14 @@ int main(int argc, char *argv[]) {
   parser.add_option("--sync-to-incoming")
       .action("store_true")
       .dest("sync_to_incoming")
-      .help("Sync to Incoming Audio: defer receive playout by the latency buffer to sync to the "
-            "incoming stream (enabled by default).");
+      .help("Sync to Incoming Audio: delay the local transport timeline by the receive buffer so "
+            "transport-locked generators align with incoming audio (enabled by default). The "
+            "receive buffer is always applied regardless of this option.");
   parser.add_option("--no-sync-to-incoming")
       .action("store_false")
       .dest("sync_to_incoming")
-      .help("Disable Sync to Incoming Audio: apply no streaming playout buffer on receive.");
+      .help("Disable Sync to Incoming Audio: the local transport runs live; incoming audio is "
+            "still buffered and audible, just not aligned with local generators.");
 
   // process args
   optparse::Values options = parser.parse_args(argc, argv);

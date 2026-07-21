@@ -184,11 +184,12 @@ private:
   // Receiver playout buffer in milliseconds (converted to beats at the current tempo in the
   // renderer). Configurable; default 100ms, clamped to [0, 2000].
   std::atomic<double> mLatencyMs{100.0};
-  // "Sync to Incoming Audio" (formerly Ableton's "Monitoring Mode"): when true, the receiver
-  // defers playout by the mLatencyMs streaming buffer to sync to the buffered incoming stream;
-  // when false, no streaming buffer is applied (target the output-time beat directly). Hardware
-  // output-latency compensation is applied either way. Default true. Implemented by passing an
-  // effective latency of mLatencyMs (on) or 0 (off) to the renderer.
+  // "Sync to Incoming Audio" (formerly Ableton's "Monitoring Mode"): when true, delay the local
+  // transport timeline (the reported JACK BBT) by the receive buffer so transport-locked local
+  // generators align with the incoming audio; when false, the transport runs live. The receive
+  // buffer (mLatencyMs) is ALWAYS applied to incoming playout regardless of this toggle (network
+  // buffers arrive late and need it) — this only gates the transport-BBT shift (timeBaseCallback).
+  // Default true.
   std::atomic<bool> mSyncToIncomingAudio{true};
   std::atomic<jack_nframes_t> mEffCaptureLatencyFrames{0};
   std::atomic<jack_nframes_t> mEffPlaybackLatencyFrames{0};

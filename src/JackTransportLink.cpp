@@ -68,7 +68,9 @@ const std::string
 // Writable receiver playout buffer, in milliseconds (converted to beats at the current tempo).
 const std::string
     linkaudio_latency_key("http://www.x37v.info/jack/metadata/linkaudio/latency");
-// Writable "Sync to Incoming Audio" toggle (apply the streaming playout buffer or not).
+// Writable "Sync to Incoming Audio" toggle: whether to delay the local transport timeline to
+// match the (always-applied) receive buffer, so transport-locked local generators align with
+// incoming audio. It does NOT gate the receive buffer itself.
 const std::string
     linkaudio_sync_key("http://www.x37v.info/jack/metadata/linkaudio/sync-to-incoming");
 // Read-only (GET) effective I/O latency actually applied to the beat mapping, in milliseconds,
@@ -866,14 +868,14 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
       double* recvPtrs[2];
       for (size_t ch = 0; ch < 2; ++ch)
         recvPtrs[ch] = mStereoRecvBuf.data() + (i * 2 + ch) * nframes;
-      // "Sync to Incoming Audio" off => no streaming buffer (pass 0ms, so the renderer targets
-      // the output-time beat directly); on => defer by the configured playout buffer.
-      const double effLatencyMs =
-          mSyncToIncomingAudio.load(std::memory_order_acquire)
-              ? mLatencyMs.load(std::memory_order_acquire)
-              : 0.0;
+      // The streaming playout buffer always applies to received audio — network buffers arrive
+      // late, so without it there is nothing to play (the live-beat target drops every buffer as
+      // too old). "Sync to Incoming Audio" does NOT gate this; it only decides whether the local
+      // transport timeline is delayed to match (see timeBaseCallback). Off => incoming still
+      // plays buffered, just not phase-aligned with transport-locked local generators.
       mRecvRenderers[i]->receive(recvPtrs, nframes, sessionState,
-                                 mSampleRate, recvHostTime, mQuantum, effLatencyMs);
+                                 mSampleRate, recvHostTime, mQuantum,
+                                 mLatencyMs.load(std::memory_order_acquire));
       for (size_t ch = 0; ch < 2; ++ch) {
         auto *outBuf = static_cast<float *>(
             jack_port_get_buffer(mAudioOuts[i * 2 + ch], nframes));
