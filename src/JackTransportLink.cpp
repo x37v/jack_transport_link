@@ -65,6 +65,9 @@ const std::string
 // The local Link peer name broadcast to the session, decoupled from the JACK client name.
 const std::string
     linkaudio_peer_name_key("http://www.x37v.info/jack/metadata/linkaudio/peer-name");
+// Writable receiver playout buffer, in milliseconds (converted to beats at the current tempo).
+const std::string
+    linkaudio_latency_key("http://www.x37v.info/jack/metadata/linkaudio/latency");
 // Read-only (GET) effective I/O latency actually applied to the beat mapping, in milliseconds,
 // plus the auto-detected-only value (effective = auto + user trim). Published so a client can
 // display what compensation is in effect.
@@ -98,6 +101,14 @@ bool get_property(jack_uuid_t subject, const std::string &key,
     jack_free(types);
   }
   return true;
+}
+
+// Sanitize a requested playout-buffer value: non-finite (NaN/inf) reverts to the default,
+// otherwise clamp to [0, 2000]. NaN must be caught here — std::clamp passes NaN through, and a
+// NaN mLatencyMs would break the self-feedback guard (NaN != NaN) and produce NaN beat targets.
+double clampLatencyMs(double v) {
+  if (!std::isfinite(v)) return 100.0;
+  return std::clamp(v, 0.0, 2000.0);
 }
 
 std::optional<double>
@@ -203,7 +214,8 @@ JackTransportLink::JackTransportLink(jack_client_t *client,
                                      std::vector<std::string> sourceNames,
                                      std::string linkPeerName,
                                      double captureLatencyTrimMs,
-                                     double playbackLatencyTrimMs)
+                                     double playbackLatencyTrimMs,
+                                     double latencyMs)
     : mJackClient(client),
       mSampleRate(static_cast<double>(jack_get_sample_rate(client))),
       mNumStereoInChannels(linkAudioStereoInChannels),
@@ -226,6 +238,7 @@ JackTransportLink::JackTransportLink(jack_client_t *client,
 
   mCaptureLatencyTrimMs.store(captureLatencyTrimMs, std::memory_order_release);
   mPlaybackLatencyTrimMs.store(playbackLatencyTrimMs, std::memory_order_release);
+  mLatencyMs.store(clampLatencyMs(latencyMs), std::memory_order_release);
 
   // setup link
   mLink.setTempoCallback([this](double bpm) {
@@ -266,6 +279,7 @@ JackTransportLink::JackTransportLink(jack_client_t *client,
       // publish the effective Link peer name (always non-empty: override or hostname)
       mAppliedLinkPeerName = effectiveLinkPeerName();
       setLinkAudioPeerNameProperty();
+      setLinkAudioLatencyMsProperty();
       jack_set_property_change_callback(
           mJackClient, JackTransportLink::propertyChangeCallback, this);
     } else {
@@ -513,6 +527,9 @@ void JackTransportLink::processEvents() {
   }
   if (mNeedsRecomputeLatency.exchange(false, std::memory_order_acq_rel)) {
     updateLatencyRanges();
+  }
+  if (mNeedsPublishLatencyMs.exchange(false, std::memory_order_acq_rel)) {
+    setLinkAudioLatencyMsProperty();
   }
   if (mReportBPM) {
     mReportBPM = false;
@@ -841,7 +858,8 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
       for (size_t ch = 0; ch < 2; ++ch)
         recvPtrs[ch] = mStereoRecvBuf.data() + (i * 2 + ch) * nframes;
       mRecvRenderers[i]->receive(recvPtrs, nframes, sessionState,
-                                 mSampleRate, recvHostTime, mQuantum);
+                                 mSampleRate, recvHostTime, mQuantum,
+                                 mLatencyMs.load(std::memory_order_acquire));
       for (size_t ch = 0; ch < 2; ++ch) {
         auto *outBuf = static_cast<float *>(
             jack_port_get_buffer(mAudioOuts[i * 2 + ch], nframes));
@@ -962,6 +980,7 @@ void JackTransportLink::propertyChangeCallback(jack_uuid_t subject,
     bool isenable = !key || start_stop_key.compare(key) == 0;
     bool islinkaudiosource = !key || linkaudio_source_key.compare(key) == 0;
     bool ispeername    = !key || linkaudio_peer_name_key.compare(key) == 0;
+    bool islatency     = !key || linkaudio_latency_key.compare(key) == 0;
     bool is_in_stereo  = !key || linkaudio_in_stereo_key.compare(key) == 0;
     bool is_out_stereo = !key || linkaudio_out_stereo_key.compare(key) == 0;
     int  linkaudiosourceidx = key ? linkAudioSourceIndex(key) : -1;
@@ -1009,6 +1028,26 @@ void JackTransportLink::propertyChangeCallback(jack_uuid_t subject,
           mLinkPeerName = values;
           mNeedsApplyPeerName.store(true, std::memory_order_release);
           mNeedsSaveConfig = true;
+        }
+      } else if (islatency &&
+                 get_property(mJackClientUUID, linkaudio_latency_key, values, types)) {
+        double clamped;
+        try {
+          clamped = clampLatencyMs(std::stod(values));
+        } catch (...) {
+          // unparseable write -> keep the current value, but correct the metadata below
+          clamped = mLatencyMs.load(std::memory_order_acquire);
+        }
+        if (clamped != mLatencyMs.load(std::memory_order_acquire)) {
+          mLatencyMs.store(clamped, std::memory_order_release);
+          mNeedsSaveConfig = true;
+        }
+        // Republish unless the metadata already holds our canonical form. This both filters our
+        // own echo (values == canonical -> skip, no loop) and corrects any out-of-range / NaN /
+        // unparseable / differently-formatted client write back to the applied value, so the
+        // read-back stays consistent even when the sanitized value equals the current one.
+        if (values != std::to_string(clamped)) {
+          mNeedsPublishLatencyMs.store(true, std::memory_order_release);
         }
       } else if (mLinkAudioEnabled && islinkaudiosource &&
                  get_property(mJackClientUUID, linkaudio_source_key, values, types)) {
@@ -1082,6 +1121,12 @@ void JackTransportLink::propertyChangeCallback(jack_uuid_t subject,
         // clearing the property reverts to auto (hostname); republish the effective name
         mLinkPeerName.clear();
         mNeedsApplyPeerName.store(true, std::memory_order_release);
+        mNeedsSaveConfig = true;
+      }
+      if (islatency) {
+        // clearing reverts to the default; republish so clients reflect it
+        mLatencyMs.store(100.0, std::memory_order_release);
+        mNeedsPublishLatencyMs.store(true, std::memory_order_release);
         mNeedsSaveConfig = true;
       }
       if (mLinkAudioEnabled && linkaudiosourceidx >= 0
@@ -1247,6 +1292,14 @@ void JackTransportLink::setLinkAudioPeerNameProperty() {
   const auto eff = effectiveLinkPeerName();
   jack_set_property(mJackClient, mJackClientUUID, linkaudio_peer_name_key.c_str(),
                     eff.c_str(), string_type);
+}
+
+// Publish the current receiver playout buffer (ms) so a client reflects the applied value.
+void JackTransportLink::setLinkAudioLatencyMsProperty() {
+  if (jack_uuid_empty(mJackClientUUID)) return;
+  std::string s = std::to_string(mLatencyMs.load(std::memory_order_acquire));
+  jack_set_property(mJackClient, mJackClientUUID, linkaudio_latency_key.c_str(),
+                    s.c_str(), decimal_type);
 }
 
 // Recompute the effective peer name; rename the Link peer only when it changed (setPeerName
@@ -1795,6 +1848,7 @@ void JackTransportLink::saveConfig() {
   cfg["link_peer_name"] = mLinkPeerName;
   cfg["link_audio_capture_latency_trim_ms"]  = mCaptureLatencyTrimMs.load(std::memory_order_acquire);
   cfg["link_audio_playback_latency_trim_ms"] = mPlaybackLatencyTrimMs.load(std::memory_order_acquire);
+  cfg["link_audio_latency_ms"]               = mLatencyMs.load(std::memory_order_acquire);
 
   std::ofstream f(mConfigPath);
   if (f.is_open())

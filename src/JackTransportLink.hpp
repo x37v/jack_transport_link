@@ -42,7 +42,8 @@ public:
                     std::vector<std::string> sourceNames = {},
                     std::string linkPeerName = "",
                     double captureLatencyTrimMs = 0.0,
-                    double playbackLatencyTrimMs = 0.0);
+                    double playbackLatencyTrimMs = 0.0,
+                    double latencyMs = 100.0);
   ~JackTransportLink();
 
   void processEvents();
@@ -87,6 +88,7 @@ private:
   void setLinkAudioChannelsProperty(const std::vector<ableton::LinkAudio::Channel>& channels);
   void setLinkAudioSourceProperty();
   void setLinkAudioSourceHealthProperty();
+  void setLinkAudioLatencyMsProperty();
   void setLinkAudioSourceFiltersProperty();
   void setLinkAudioInStereoChannelsProperty(size_t n);
   void setLinkAudioOutStereoChannelsProperty(size_t n);
@@ -177,6 +179,9 @@ private:
   std::atomic<jack_nframes_t> mAutoPlaybackLatencyFrames{0};
   std::atomic<double> mCaptureLatencyTrimMs{0.0};
   std::atomic<double> mPlaybackLatencyTrimMs{0.0};
+  // Receiver playout buffer in milliseconds (converted to beats at the current tempo in the
+  // renderer). Configurable; default 100ms, clamped to [0, 2000].
+  std::atomic<double> mLatencyMs{100.0};
   std::atomic<jack_nframes_t> mEffCaptureLatencyFrames{0};
   std::atomic<jack_nframes_t> mEffPlaybackLatencyFrames{0};
   // Set by the latency callback (JACK notification thread) on graph/buffer-size changes; drained
@@ -184,6 +189,9 @@ private:
   // off the notification thread avoids both racing rebuildAudioPorts() on the port vectors and the
   // illegal jack_set_property-from-notification-thread call.
   std::atomic<bool> mNeedsRecomputeLatency{false};
+  // Set when the playout-buffer (mLatencyMs) value changes; drained in processEvents to
+  // republish the (possibly clamped/reverted) value off the notification thread.
+  std::atomic<bool> mNeedsPublishLatencyMs{false};
 
   // Per-receiver source filters — written from property/OSC callbacks, read in processEvents.
   // Empty string = any (auto). Guarded by mSourceFilterMutex.

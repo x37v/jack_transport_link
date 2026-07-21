@@ -120,7 +120,8 @@ public:
                typename Link::SessionState sessionState,
                double sampleRate,
                const std::chrono::microseconds hostTime,
-               double quantum)
+               double quantum,
+               double latencyMs)
   {
     auto silenceOutputs = [&]() {
       for (size_t ch = 0; ch < mNumChannels; ++ch)
@@ -135,7 +136,11 @@ public:
     // then means the queue starved (a real dropout), as opposed to normal pre-roll silence.
     const bool wasRendering = moStartReadPos.has_value();
 
-    constexpr auto kLatencyInBeats = 4;
+    // Playout buffer expressed in milliseconds, converted to beats at the current tempo — the
+    // same scheme Ableton Live and Max use (latency_beats = (ms/1000) * (bpm/60)). Expressing it
+    // in ms keeps the real-time buffer depth constant regardless of tempo (a fixed beat count
+    // would shrink in real time as the tempo rises).
+    const double kLatencyInBeats = (latencyMs / 1000.0) * (sessionState.tempo() / 60.0);
     const auto targetBeatsAtBufferBegin =
       sessionState.beatAtTime(hostTime, quantum) - kLatencyInBeats;
     const auto targetBeatsAtBufferEnd =
@@ -445,6 +450,7 @@ public:
                typename Link::SessionState,
                double,
                const std::chrono::microseconds,
+               double,
                double) {}
 
   bool hasSource() const { return false; }

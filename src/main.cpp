@@ -167,6 +167,13 @@ int main(int argc, char *argv[]) {
       .help("Trim (ms) added to JACK's auto-detected playback latency for Link Audio receive "
             "alignment; covers converter latency JACK can't see. default: %default.");
 
+  parser.add_option("--latency-ms")
+      .type("double")
+      .dest("latency_ms")
+      .set_default("100.0")
+      .help("Link Audio receiver playout buffer in milliseconds (converted to beats at the "
+            "current tempo), range 0-2000. default: %default.");
+
   // process args
   optparse::Values options = parser.parse_args(argc, argv);
   std::vector<std::string> args = parser.args();
@@ -242,6 +249,9 @@ int main(int argc, char *argv[]) {
       ? (double)options.get("playback_latency_trim_ms")
       : cfg.value("link_audio_playback_latency_trim_ms",
                   (double)options.get("playback_latency_trim_ms"));
+  double latencyMs = options.is_set_by_user("latency_ms")
+      ? (double)options.get("latency_ms")
+      : cfg.value("link_audio_latency_ms", (double)options.get("latency_ms"));
 
   if (initialBPM <= 0.0 || initialQuantum < 1.0 || initialTimeSigDenom < 1.0 ||
       initialTicksPerBeat < 1.0) {
@@ -263,7 +273,7 @@ int main(int argc, char *argv[]) {
                           linkAudioOutChannels,
                           initialSyncLink, configPath,
                           sinkNames, sourceNames, linkPeerName,
-                          captureLatencyTrimMs, playbackLatencyTrimMs);
+                          captureLatencyTrimMs, playbackLatencyTrimMs, latencyMs);
       if (cfg.contains("source_filters"))
         j.applySourceFiltersFromConfig(cfg["source_filters"].dump());
 
