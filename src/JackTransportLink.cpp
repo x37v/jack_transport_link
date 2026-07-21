@@ -33,6 +33,10 @@ const std::string
     linknumpeers_key("http://www.x37v.info/jack/metadata/linkpeers");
 const std::string
     start_stop_key("http://www.x37v.info/jack/metadata/link/start-stop-sync");
+// Writable master Link on/off. false => leave the Link session (invisible to peers, no tempo
+// sync, no Link Audio); jtl still runs as the local JACK transport master.
+const std::string
+    link_enabled_key("http://www.x37v.info/jack/metadata/link/enabled");
 const std::string
     linkaudio_source_key("http://www.x37v.info/jack/metadata/linkaudio/source");
 const std::string
@@ -221,7 +225,8 @@ JackTransportLink::JackTransportLink(jack_client_t *client,
                                      double captureLatencyTrimMs,
                                      double playbackLatencyTrimMs,
                                      double latencyMs,
-                                     bool syncToIncomingAudio)
+                                     bool syncToIncomingAudio,
+                                     bool linkEnabled)
     : mJackClient(client),
       mSampleRate(static_cast<double>(jack_get_sample_rate(client))),
       mNumStereoInChannels(linkAudioStereoInChannels),
@@ -246,6 +251,7 @@ JackTransportLink::JackTransportLink(jack_client_t *client,
   mPlaybackLatencyTrimMs.store(playbackLatencyTrimMs, std::memory_order_release);
   mLatencyMs.store(clampLatencyMs(latencyMs), std::memory_order_release);
   mSyncToIncomingAudio.store(syncToIncomingAudio, std::memory_order_release);
+  mLinkEnabledDesired.store(linkEnabled, std::memory_order_release);
 
   // setup link
   mLink.setTempoCallback([this](double bpm) {
@@ -269,7 +275,8 @@ JackTransportLink::JackTransportLink(jack_client_t *client,
   mLink.enableStartStopSync(enableStartStopSync);
   mLink.setNumPeersCallback(
       [this](std::size_t numPeers) { setNumPeersProperty(numPeers); });
-  mLink.enable(true);
+  // Master Link on/off: when disabled, we never join the session, so peers don't see us.
+  mLink.enable(mLinkEnabledDesired.load(std::memory_order_acquire));
 
   // intialize our properties
   {
@@ -282,6 +289,7 @@ JackTransportLink::JackTransportLink(jack_client_t *client,
       setBPMProperty(mBPM.load(std::memory_order_acquire));
       setEnableStartStopProperty(mLink.isStartStopSyncEnabled());
       setSyncProperty(mSyncLink);
+      setLinkEnabledProperty();
       setNumPeersProperty(mLink.numPeers());
       // publish the effective Link peer name (always non-empty: override or hostname)
       mAppliedLinkPeerName = effectiveLinkPeerName();
@@ -541,6 +549,13 @@ void JackTransportLink::processEvents() {
   }
   if (mNeedsPublishSyncToIncoming.exchange(false, std::memory_order_acq_rel)) {
     setLinkAudioSyncToIncomingProperty();
+  }
+  if (mNeedsApplyLinkEnabled.exchange(false, std::memory_order_acq_rel)) {
+    // mLink.enable() is not RT-safe; applying here on the main thread is correct.
+    mLink.enable(mLinkEnabledDesired.load(std::memory_order_acquire));
+  }
+  if (mNeedsPublishLinkEnabled.exchange(false, std::memory_order_acq_rel)) {
+    setLinkEnabledProperty();
   }
   if (mReportBPM) {
     mReportBPM = false;
@@ -1017,6 +1032,7 @@ void JackTransportLink::propertyChangeCallback(jack_uuid_t subject,
     bool ispeername    = !key || linkaudio_peer_name_key.compare(key) == 0;
     bool islatency     = !key || linkaudio_latency_key.compare(key) == 0;
     bool issync        = !key || linkaudio_sync_key.compare(key) == 0;
+    bool islinkenabled = !key || link_enabled_key.compare(key) == 0;
     bool is_in_stereo  = !key || linkaudio_in_stereo_key.compare(key) == 0;
     bool is_out_stereo = !key || linkaudio_out_stereo_key.compare(key) == 0;
     int  linkaudiosourceidx = key ? linkAudioSourceIndex(key) : -1;
@@ -1053,6 +1069,20 @@ void JackTransportLink::propertyChangeCallback(jack_uuid_t subject,
           mReportBPM = true;
         }
         mNeedsSaveConfig = true;
+      } else if (islinkenabled &&
+                 get_property(mJackClientUUID, link_enabled_key, values, types)) {
+        const bool set = std::find(true_values.begin(), true_values.end(), values) !=
+                         true_values.end();
+        if (set != mLinkEnabledDesired.load(std::memory_order_acquire)) {
+          mLinkEnabledDesired.store(set, std::memory_order_release);
+          mNeedsApplyLinkEnabled.store(true, std::memory_order_release);
+          mNeedsSaveConfig = true;
+        }
+        // Correct any non-canonical write (e.g. "1"/"0") back to "true"/"false"; our own echo
+        // matches and is skipped.
+        if (values != std::string(set ? "true" : "false")) {
+          mNeedsPublishLinkEnabled.store(true, std::memory_order_release);
+        }
       } else if (ispeername &&
                  get_property(mJackClientUUID, linkaudio_peer_name_key, values, types)) {
         // The published value is the *effective* name (override or hostname), so a
@@ -1166,6 +1196,13 @@ void JackTransportLink::propertyChangeCallback(jack_uuid_t subject,
         mReportStartStopEnable = true;
       if (islinksync)
         mReportLinkSync = true;
+      if (islinkenabled) {
+        // clearing reverts to the default (enabled); re-apply + republish
+        mLinkEnabledDesired.store(true, std::memory_order_release);
+        mNeedsApplyLinkEnabled.store(true, std::memory_order_release);
+        mNeedsPublishLinkEnabled.store(true, std::memory_order_release);
+        mNeedsSaveConfig = true;
+      }
       if (ispeername) {
         // clearing the property reverts to auto (hostname); republish the effective name
         mLinkPeerName.clear();
@@ -1232,6 +1269,12 @@ void JackTransportLink::setSyncProperty(bool sync) {
     jack_set_property(mJackClient, mJackClientUUID, linksync_key.c_str(),
                       s.c_str(), bool_type);
   }
+}
+
+void JackTransportLink::setLinkEnabledProperty() {
+  if (jack_uuid_empty(mJackClientUUID)) return;
+  const char* s = mLinkEnabledDesired.load(std::memory_order_acquire) ? "true" : "false";
+  jack_set_property(mJackClient, mJackClientUUID, link_enabled_key.c_str(), s, bool_type);
 }
 
 void JackTransportLink::setNumPeersProperty(size_t peers) {
@@ -1912,6 +1955,7 @@ void JackTransportLink::saveConfig() {
   cfg["link_audio_playback_latency_trim_ms"] = mPlaybackLatencyTrimMs.load(std::memory_order_acquire);
   cfg["link_audio_latency_ms"]               = mLatencyMs.load(std::memory_order_acquire);
   cfg["link_audio_sync_to_incoming"]         = mSyncToIncomingAudio.load(std::memory_order_acquire);
+  cfg["link_enabled"]                        = mLinkEnabledDesired.load(std::memory_order_acquire);
 
   std::ofstream f(mConfigPath);
   if (f.is_open())

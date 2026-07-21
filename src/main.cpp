@@ -187,6 +187,17 @@ int main(int argc, char *argv[]) {
       .help("Disable Sync to Incoming Audio: the local transport runs live; incoming audio is "
             "still buffered and audible, just not aligned with local generators.");
 
+  parser.set_defaults("link_enabled", "1");
+  parser.add_option("--link")
+      .action("store_true")
+      .dest("link_enabled")
+      .help("Join the Ableton Link session (enabled by default).");
+  parser.add_option("--no-link")
+      .action("store_false")
+      .dest("link_enabled")
+      .help("Do not join the Ableton Link session: peers don't see this device, and tempo sync "
+            "and Link Audio are inactive; jtl still runs as the local JACK transport master.");
+
   // process args
   optparse::Values options = parser.parse_args(argc, argv);
   std::vector<std::string> args = parser.args();
@@ -268,6 +279,9 @@ int main(int argc, char *argv[]) {
   bool syncToIncomingAudio = options.is_set_by_user("sync_to_incoming")
       ? (bool)options.get("sync_to_incoming")
       : cfg.value("link_audio_sync_to_incoming", (bool)options.get("sync_to_incoming"));
+  bool linkEnabled = options.is_set_by_user("link_enabled")
+      ? (bool)options.get("link_enabled")
+      : cfg.value("link_enabled", (bool)options.get("link_enabled"));
 
   if (initialBPM <= 0.0 || initialQuantum < 1.0 || initialTimeSigDenom < 1.0 ||
       initialTicksPerBeat < 1.0) {
@@ -290,7 +304,7 @@ int main(int argc, char *argv[]) {
                           initialSyncLink, configPath,
                           sinkNames, sourceNames, linkPeerName,
                           captureLatencyTrimMs, playbackLatencyTrimMs, latencyMs,
-                          syncToIncomingAudio);
+                          syncToIncomingAudio, linkEnabled);
       if (cfg.contains("source_filters"))
         j.applySourceFiltersFromConfig(cfg["source_filters"].dump());
 

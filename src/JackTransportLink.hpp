@@ -44,7 +44,8 @@ public:
                     double captureLatencyTrimMs = 0.0,
                     double playbackLatencyTrimMs = 0.0,
                     double latencyMs = 100.0,
-                    bool syncToIncomingAudio = true);
+                    bool syncToIncomingAudio = true,
+                    bool linkEnabled = true);
   ~JackTransportLink();
 
   void processEvents();
@@ -91,6 +92,7 @@ private:
   void setLinkAudioSourceHealthProperty();
   void setLinkAudioLatencyMsProperty();
   void setLinkAudioSyncToIncomingProperty();
+  void setLinkEnabledProperty();
   void setLinkAudioSourceFiltersProperty();
   void setLinkAudioInStereoChannelsProperty(size_t n);
   void setLinkAudioOutStereoChannelsProperty(size_t n);
@@ -203,6 +205,14 @@ private:
   std::atomic<bool> mNeedsPublishLatencyMs{false};
   // Same, for the sync-to-incoming-audio toggle.
   std::atomic<bool> mNeedsPublishSyncToIncoming{false};
+
+  // Master Link on/off. When false we call mLink.enable(false), leaving the Link session so
+  // peers don't see us at all (also stops tempo sync + Link Audio); jtl keeps running as the
+  // local JACK transport master. mLink.enable() is not RT-safe, so the desired state is applied
+  // from processEvents. Default true.
+  std::atomic<bool> mLinkEnabledDesired{true};
+  std::atomic<bool> mNeedsApplyLinkEnabled{false};
+  std::atomic<bool> mNeedsPublishLinkEnabled{false};
 
   // Per-receiver source filters — written from property/OSC callbacks, read in processEvents.
   // Empty string = any (auto). Guarded by mSourceFilterMutex.
