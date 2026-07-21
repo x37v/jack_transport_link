@@ -1,7 +1,10 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
+#include <cstdint>
 
 #if defined(LINK_AUDIO)
 
@@ -128,6 +131,10 @@ public:
     {
     }
 
+    // We were mid-stream if a read position is already established; producing silence from here
+    // then means the queue starved (a real dropout), as opposed to normal pre-roll silence.
+    const bool wasRendering = moStartReadPos.has_value();
+
     constexpr auto kLatencyInBeats = 4;
     const auto targetBeatsAtBufferBegin =
       sessionState.beatAtTime(hostTime, quantum) - kLatencyInBeats;
@@ -154,6 +161,7 @@ public:
 
     if (mpQueueReader->numRetainedSlots() == 0)
     {
+      if (wasRendering) mDropoutCount.fetch_add(1, std::memory_order_relaxed);
       silenceOutputs();
       moLastFrameIdx = std::nullopt;
       moStartReadPos = std::nullopt;
@@ -211,6 +219,7 @@ public:
 
     if (!foundEnd)
     {
+      if (wasRendering) mDropoutCount.fetch_add(1, std::memory_order_relaxed);
       silenceOutputs();
       moLastFrameIdx = std::nullopt;
       moStartReadPos = std::nullopt;
@@ -222,6 +231,7 @@ public:
 
     if (totalFrames <= 0.0)
     {
+      if (wasRendering) mDropoutCount.fetch_add(1, std::memory_order_relaxed);
       silenceOutputs();
       moLastFrameIdx = std::nullopt;
       moStartReadPos = std::nullopt;
@@ -328,13 +338,42 @@ public:
 
       moLastFrameIdx = std::nullopt;
       moStartReadPos = std::nullopt;
+
+      // Reset health to a clean per-connection slate. Safe here: mpSource is destroyed above,
+      // so no onSourceBuffer callback can be running. Without clearing mHasLastArrival, the
+      // first arrival of the next source would measure its gap against this source's last
+      // arrival (seconds stale on a switch/reconnect) and report a huge spurious jitter spike.
+      mHasLastArrival = false;
+      mJitterMs.store(0.0f, std::memory_order_relaxed);
+      mDropoutCount.store(0, std::memory_order_relaxed);
+      mBuffered.store(0.0f, std::memory_order_relaxed);
     }
   }
 
   float buffered() const { return mBuffered; }
+  uint32_t dropoutCount() const { return mDropoutCount.load(std::memory_order_relaxed); }
+  float jitterMs() const { return mJitterMs.load(std::memory_order_relaxed); }
 
   void onSourceBuffer(const LinkAudioSource::BufferHandle bufferHandle)
   {
+    // Network jitter estimate (RFC 3550 style): compare the actual gap between arriving buffers
+    // to the gap implied by their audio duration; the smoothed absolute deviation is the jitter.
+    // Runs on the Link callback thread only, so the arrival-time state needs no synchronization.
+    const auto now = std::chrono::steady_clock::now();
+    if (mHasLastArrival && bufferHandle.info.sampleRate > 0)
+    {
+      const double actualMs =
+        std::chrono::duration<double, std::milli>(now - mLastArrival).count();
+      const double expectedMs = 1000.0 * double(bufferHandle.info.numFrames)
+                                / double(bufferHandle.info.sampleRate);
+      const double d = std::abs(actualMs - expectedMs);
+      float j = mJitterMs.load(std::memory_order_relaxed);
+      j += (static_cast<float>(d) - j) / 16.0f;
+      mJitterMs.store(j, std::memory_order_relaxed);
+    }
+    mLastArrival = now;
+    mHasLastArrival = true;
+
     if (mpQueueWriter->retainSlot())
     {
       auto& buffer = *((*mpQueueWriter)[0]);
@@ -356,6 +395,13 @@ private:
 
   std::optional<double> moStartReadPos;
   std::atomic<float> mBuffered = 0;
+
+  // Health metrics: dropouts (starvation underruns) counted in receive() on the RT thread;
+  // jitter updated in onSourceBuffer on the Link thread; both read non-RT for publishing.
+  std::atomic<uint32_t> mDropoutCount{0};
+  std::atomic<float> mJitterMs{0.0f};
+  std::chrono::steady_clock::time_point mLastArrival{};
+  bool mHasLastArrival = false;
 
   std::shared_ptr<typename Queue::Writer> mpQueueWriter;
   std::shared_ptr<typename Queue::Reader> mpQueueReader;
@@ -406,6 +452,8 @@ public:
   void createSource(const ChannelId&) {}
   void removeSource() {}
   float buffered() const { return 0.0f; }
+  uint32_t dropoutCount() const { return 0; }
+  float jitterMs() const { return 0.0f; }
 };
 
 } // namespace linkaudio

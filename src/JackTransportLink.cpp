@@ -43,6 +43,10 @@ const std::string
 // so our own status publishing doesn't feed back into the desired-filter parsing.
 const std::string
     linkaudio_source_status_key("http://www.x37v.info/jack/metadata/linkaudio/source-status");
+// Per-source stream health (buffered ms, dropout count, jitter ms, connected), published
+// periodically so a client can display live receive quality.
+const std::string
+    linkaudio_source_health_key("http://www.x37v.info/jack/metadata/linkaudio/source-health");
 const char *string_type = "text/plain";
 // JACK's standard port presentation metadata (grouping + display name), set on our own
 // audio ports so patchbays (e.g. the RNBO runner's graph editor) group and label them.
@@ -492,6 +496,15 @@ void JackTransportLink::processEvents() {
     if (mUpdatePortMeta) {
       mUpdatePortMeta = false;
       updateAudioPortMetadata();
+    }
+    // Publish live receive health on a timer (values change every audio block; a client only
+    // needs a few updates/second). Runs on the main thread, so jack_set_property is legal here.
+    if (!mRecvRenderers.empty()) {
+      auto now = std::chrono::steady_clock::now();
+      if (now - mLastHealthPublish >= std::chrono::milliseconds(250)) {
+        mLastHealthPublish = now;
+        setLinkAudioSourceHealthProperty();
+      }
     }
   }
   // Link peer name applies regardless of Link Audio: Link itself is always enabled.
@@ -1168,6 +1181,23 @@ void JackTransportLink::setLinkAudioSourceProperty() {
     arr.push_back(entry);
   }
   jack_set_property(mJackClient, mJackClientUUID, linkaudio_source_status_key.c_str(),
+                    arr.dump().c_str(), "application/json");
+}
+
+// Per-source live receive health. buffered() is in seconds (from the renderer); dropouts and
+// jitter come from the renderer's atomics. Published on a timer from processEvents.
+void JackTransportLink::setLinkAudioSourceHealthProperty() {
+  if (jack_uuid_empty(mJackClientUUID)) return;
+  nlohmann::json arr = nlohmann::json::array();
+  for (size_t i = 0; i < mRecvRenderers.size(); ++i) {
+    arr.push_back({
+        {"buffered_ms", 1000.0 * mRecvRenderers[i]->buffered()},
+        {"dropouts",    mRecvRenderers[i]->dropoutCount()},
+        {"jitter_ms",   mRecvRenderers[i]->jitterMs()},
+        {"connected",   mCurrentSourceChannelIds[i].has_value()},
+    });
+  }
+  jack_set_property(mJackClient, mJackClientUUID, linkaudio_source_health_key.c_str(),
                     arr.dump().c_str(), "application/json");
 }
 

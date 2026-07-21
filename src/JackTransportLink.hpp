@@ -86,6 +86,7 @@ private:
   void setNumPeersProperty(size_t peers);
   void setLinkAudioChannelsProperty(const std::vector<ableton::LinkAudio::Channel>& channels);
   void setLinkAudioSourceProperty();
+  void setLinkAudioSourceHealthProperty();
   void setLinkAudioSourceFiltersProperty();
   void setLinkAudioInStereoChannelsProperty(size_t n);
   void setLinkAudioOutStereoChannelsProperty(size_t n);
@@ -203,6 +204,8 @@ private:
   std::string mConfigPath;
   bool mNeedsSaveConfig = false;
   std::chrono::steady_clock::time_point mLastConfigSave{};
+  // Throttle for periodic source-health metadata publishing (see processEvents).
+  std::chrono::steady_clock::time_point mLastHealthPublish{};
 
   // Per-slot user names. Empty = use the default ("Send N" for sinks).
   // mSinkNames tracks the outgoing (SinkRenderer / in_N) slots, mSourceNames the
