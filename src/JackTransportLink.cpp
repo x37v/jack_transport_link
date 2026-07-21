@@ -941,10 +941,29 @@ void JackTransportLink::timeBaseCallback(jack_transport_state_t transportState,
     invalidateClockSyncBBT();
   }
 
+  // "Sync to Incoming Audio": the receiver plays the incoming stream kLatencyInBeats behind the
+  // live beat (see the receive path). Shift the transport position we report by the same amount
+  // so JACK-transport consumers (the RNBO engine's phasor, MIDI clock, click) run on that same
+  // delayed timeline and stay phase-aligned with the received audio. The Link Audio send/receive
+  // paths query the Link session beat directly, not this BBT, so they are unaffected (external
+  // sources stay synced; sent audio stays globally correct). Uses the reported bpm for exact
+  // consistency with the pos we publish; mInternalBeat itself is left intact for Link sync.
+  //
+  // Only shift when we actually have incoming audio to sync to (Link Audio enabled with >=1
+  // receive channel). Otherwise (send-only or Link Audio off) there is nothing to monitor
+  // against, and delaying the transport would only misalign a transport-locked generator feeding
+  // a sink (its content would lag while the send path still stamps the live Link beat).
+  double reportedBeat = mInternalBeat;
+  if (mSyncToIncomingAudio.load(std::memory_order_acquire) && bpm > 0.0
+      && mLinkAudioEnabled && mNumStereoOutChannels > 0) {
+    reportedBeat -= (mLatencyMs.load(std::memory_order_acquire) / 1000.0) * (bpm / 60.0);
+  }
+
   // what if quantum changes? Does link keep track of that or should we compute
   // bar some other way?
-  auto bar = std::floor(mInternalBeat / mQuantum);
-  auto beat = std::fmod(mInternalBeat, mQuantum);
+  auto bar = std::floor(reportedBeat / mQuantum);
+  auto beat = std::fmod(reportedBeat, mQuantum);
+  if (beat < 0.0) beat += mQuantum; // keep phase/tick positive through the start-up transient
   auto tick = trunc(ticksPerBeat * (beat - trunc(beat)));
   float beatType = bbtValid ? pos->beat_type : mInitialTimeSigDenom;
 
