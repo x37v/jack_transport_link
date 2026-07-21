@@ -4,6 +4,7 @@
 #include <jack/uuid.h>
 #include <unistd.h>
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -60,6 +61,17 @@ const std::string
 // The local Link peer name broadcast to the session, decoupled from the JACK client name.
 const std::string
     linkaudio_peer_name_key("http://www.x37v.info/jack/metadata/linkaudio/peer-name");
+// Read-only (GET) effective I/O latency actually applied to the beat mapping, in milliseconds,
+// plus the auto-detected-only value (effective = auto + user trim). Published so a client can
+// display what compensation is in effect.
+const std::string
+    linkaudio_capture_latency_key("http://www.x37v.info/jack/metadata/linkaudio/capture-latency");
+const std::string
+    linkaudio_playback_latency_key("http://www.x37v.info/jack/metadata/linkaudio/playback-latency");
+const std::string
+    linkaudio_capture_latency_auto_key("http://www.x37v.info/jack/metadata/linkaudio/capture-latency-auto");
+const std::string
+    linkaudio_playback_latency_auto_key("http://www.x37v.info/jack/metadata/linkaudio/playback-latency-auto");
 const std::array<std::string, 2> true_values = {"true", "1"};
 
 const std::array<uint8_t, 1> midi_clock_buf = {248};
@@ -185,7 +197,9 @@ JackTransportLink::JackTransportLink(jack_client_t *client,
                                      std::string configPath,
                                      std::vector<std::string> sinkNames,
                                      std::vector<std::string> sourceNames,
-                                     std::string linkPeerName)
+                                     std::string linkPeerName,
+                                     double captureLatencyTrimMs,
+                                     double playbackLatencyTrimMs)
     : mJackClient(client),
       mSampleRate(static_cast<double>(jack_get_sample_rate(client))),
       mNumStereoInChannels(linkAudioStereoInChannels),
@@ -205,6 +219,9 @@ JackTransportLink::JackTransportLink(jack_client_t *client,
       mSinkNames(std::move(sinkNames)),
       mSourceNames(std::move(sourceNames)) {
   // setup listener
+
+  mCaptureLatencyTrimMs.store(captureLatencyTrimMs, std::memory_order_release);
+  mPlaybackLatencyTrimMs.store(playbackLatencyTrimMs, std::memory_order_release);
 
   // setup link
   mLink.setTempoCallback([this](double bpm) {
@@ -336,7 +353,14 @@ JackTransportLink::JackTransportLink(jack_client_t *client,
   jack_set_timebase_callback(mJackClient, 0,
                              JackTransportLink::timeBaseCallback, this);
   jack_set_sync_callback(mJackClient, JackTransportLink::syncCallback, this);
+  // Auto-detect I/O latency: JACK invokes this (non-RT) on graph/buffer-size changes, once per
+  // direction, and we read the corresponding port latency range. Registered even when Link Audio
+  // is disabled (no ports -> detected latency stays 0, only the user trim applies).
+  jack_set_latency_callback(mJackClient, JackTransportLink::latencyCallback, this);
   jack_activate(mJackClient);
+  // Seed effective latency + publish read-backs now (auto values arrive via the latency callback
+  // once ports are connected; until then effective = user trim only).
+  recomputeEffectiveLatency();
 }
 
 JackTransportLink::~JackTransportLink() {
@@ -358,6 +382,76 @@ int JackTransportLink::bufferSizeCallback(jack_nframes_t nframes) {
   mStereoSendBuf.resize(mNumStereoInChannels * 2 * nframes);
   mStereoRecvBuf.resize(mNumStereoOutChannels * 2 * nframes);
   return 0;
+}
+
+void JackTransportLink::latencyCallback(jack_latency_callback_mode_t, void *arg) {
+  // Runs on JACK's notification thread. Reading the port latency ranges here would race with
+  // rebuildAudioPorts() mutating the port vectors on the main thread (and jack_set_property is
+  // illegal from this thread), so just flag it; processEvents does the read + republish.
+  static_cast<JackTransportLink *>(arg)->mNeedsRecomputeLatency.store(
+      true, std::memory_order_release);
+}
+
+void JackTransportLink::updateLatencyRanges() {
+  // Main-thread (serialized with rebuildAudioPorts). We are a terminal client and add no latency
+  // of our own, so we don't declare any; we only read the systemic latency JACK has computed for
+  // our ports. Capture latency of an in_N port = how long ago its audio was captured (send
+  // offset); playback latency of an out_N port = how long until its audio is heard (recv offset).
+  auto maxLatency = [](const std::vector<jack_port_t *> &ports,
+                       jack_latency_callback_mode_t m) -> jack_nframes_t {
+    jack_nframes_t maxFrames = 0;
+    for (auto *p : ports) {
+      if (!p) continue;
+      jack_latency_range_t range;
+      jack_port_get_latency_range(p, m, &range);
+      maxFrames = std::max(maxFrames, range.max);
+    }
+    return maxFrames;
+  };
+  mAutoCaptureLatencyFrames.store(maxLatency(mAudioIns, JackCaptureLatency),
+                                  std::memory_order_release);
+  mAutoPlaybackLatencyFrames.store(maxLatency(mAudioOuts, JackPlaybackLatency),
+                                   std::memory_order_release);
+  recomputeEffectiveLatency();
+}
+
+void JackTransportLink::recomputeEffectiveLatency() {
+  const double sr = mSampleRate > 0.0 ? mSampleRate : 48000.0;
+  auto effFrames = [sr](jack_nframes_t autoFrames, double trimMs) -> jack_nframes_t {
+    const double frames = static_cast<double>(autoFrames) + trimMs * sr / 1000.0;
+    return frames > 0.0 ? static_cast<jack_nframes_t>(std::llround(frames)) : 0;
+  };
+  mEffCaptureLatencyFrames.store(
+      effFrames(mAutoCaptureLatencyFrames.load(std::memory_order_acquire),
+                mCaptureLatencyTrimMs.load(std::memory_order_acquire)),
+      std::memory_order_release);
+  mEffPlaybackLatencyFrames.store(
+      effFrames(mAutoPlaybackLatencyFrames.load(std::memory_order_acquire),
+                mPlaybackLatencyTrimMs.load(std::memory_order_acquire)),
+      std::memory_order_release);
+  // All callers (constructor + processEvents) are on the main thread, so publishing the read-only
+  // metadata directly here is safe (jack_set_property must not run on the notification thread).
+  setLinkAudioLatencyProperties();
+}
+
+void JackTransportLink::setLinkAudioLatencyProperties() {
+  if (jack_uuid_empty(mJackClientUUID)) return;
+  const double sr = mSampleRate > 0.0 ? mSampleRate : 48000.0;
+  auto ms = [sr](jack_nframes_t frames) {
+    return std::to_string(1000.0 * static_cast<double>(frames) / sr);
+  };
+  jack_set_property(mJackClient, mJackClientUUID, linkaudio_capture_latency_key.c_str(),
+                    ms(mEffCaptureLatencyFrames.load(std::memory_order_acquire)).c_str(),
+                    decimal_type);
+  jack_set_property(mJackClient, mJackClientUUID, linkaudio_playback_latency_key.c_str(),
+                    ms(mEffPlaybackLatencyFrames.load(std::memory_order_acquire)).c_str(),
+                    decimal_type);
+  jack_set_property(mJackClient, mJackClientUUID, linkaudio_capture_latency_auto_key.c_str(),
+                    ms(mAutoCaptureLatencyFrames.load(std::memory_order_acquire)).c_str(),
+                    decimal_type);
+  jack_set_property(mJackClient, mJackClientUUID, linkaudio_playback_latency_auto_key.c_str(),
+                    ms(mAutoPlaybackLatencyFrames.load(std::memory_order_acquire)).c_str(),
+                    decimal_type);
 }
 
 void JackTransportLink::processEvents() {
@@ -403,6 +497,9 @@ void JackTransportLink::processEvents() {
   // Link peer name applies regardless of Link Audio: Link itself is always enabled.
   if (mNeedsApplyPeerName.exchange(false, std::memory_order_acq_rel)) {
     applyLinkPeerName();
+  }
+  if (mNeedsRecomputeLatency.exchange(false, std::memory_order_acq_rel)) {
+    updateLatencyRanges();
   }
   if (mReportBPM) {
     mReportBPM = false;
@@ -700,6 +797,19 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
   if (mLinkAudioEnabled && (!mSendRenderers.empty() || !mRecvRenderers.empty())) {
     auto sessionState = mLink.captureAudioSessionState();
 
+    // I/O latency compensation (see header): audio in the in_N buffer was captured
+    // capture-latency frames ago, so stamp it to that earlier beat; audio written to out_N
+    // will be heard playback-latency frames from now, so target the beat for that later time.
+    const auto framesToUsec = [this](jack_nframes_t frames) {
+      if (frames == 0 || mSampleRate <= 0.0) return std::chrono::microseconds(0);
+      return std::chrono::microseconds(
+          std::llround(1.0e6 * static_cast<double>(frames) / mSampleRate));
+    };
+    const auto sendHostTime =
+        mTimeNext - framesToUsec(mEffCaptureLatencyFrames.load(std::memory_order_acquire));
+    const auto recvHostTime =
+        mTimeNext + framesToUsec(mEffPlaybackLatencyFrames.load(std::memory_order_acquire));
+
     for (size_t i = 0; i < mNumStereoInChannels; ++i) {
       double* sendPtrs[2];
       for (size_t ch = 0; ch < 2; ++ch) {
@@ -710,7 +820,7 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
           sendPtrs[ch][f] = static_cast<double>(inBuf[f]);
       }
       mSendRenderers[i]->send(sendPtrs, nframes, sessionState,
-                              mSampleRate, mTimeNext, mQuantum);
+                              mSampleRate, sendHostTime, mQuantum);
     }
 
     for (size_t i = 0; i < mNumStereoOutChannels; ++i) {
@@ -718,7 +828,7 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
       for (size_t ch = 0; ch < 2; ++ch)
         recvPtrs[ch] = mStereoRecvBuf.data() + (i * 2 + ch) * nframes;
       mRecvRenderers[i]->receive(recvPtrs, nframes, sessionState,
-                                 mSampleRate, mTimeNext, mQuantum);
+                                 mSampleRate, recvHostTime, mQuantum);
       for (size_t ch = 0; ch < 2; ++ch) {
         auto *outBuf = static_cast<float *>(
             jack_port_get_buffer(mAudioOuts[i * 2 + ch], nframes));
@@ -1653,6 +1763,8 @@ void JackTransportLink::saveConfig() {
   cfg["sink_names"]     = mSinkNames;
   cfg["source_names"]   = mSourceNames;
   cfg["link_peer_name"] = mLinkPeerName;
+  cfg["link_audio_capture_latency_trim_ms"]  = mCaptureLatencyTrimMs.load(std::memory_order_acquire);
+  cfg["link_audio_playback_latency_trim_ms"] = mPlaybackLatencyTrimMs.load(std::memory_order_acquire);
 
   std::ofstream f(mConfigPath);
   if (f.is_open())

@@ -40,7 +40,9 @@ public:
                     std::string configPath = "",
                     std::vector<std::string> sinkNames = {},
                     std::vector<std::string> sourceNames = {},
-                    std::string linkPeerName = "");
+                    std::string linkPeerName = "",
+                    double captureLatencyTrimMs = 0.0,
+                    double playbackLatencyTrimMs = 0.0);
   ~JackTransportLink();
 
   void processEvents();
@@ -55,6 +57,7 @@ public:
   static void propertyChangeCallback(jack_uuid_t subject, const char *key,
                                      jack_property_change_t change, void *arg);
   static int bufferSizeCallback(jack_nframes_t nframes, void *arg);
+  static void latencyCallback(jack_latency_callback_mode_t mode, void *arg);
 
 protected:
   virtual void ProcessMessage(const oscpack::ReceivedMessage &m,
@@ -68,6 +71,15 @@ private:
   void propertyChangeCallback(jack_uuid_t subject, const char *key,
                               jack_property_change_t change);
   int bufferSizeCallback(jack_nframes_t nframes);
+  // Re-read JACK's measured capture/playback latency from our in_N/out_N ports, then recompute
+  // effective values. Called from processEvents (main thread) — NOT from the latency callback —
+  // so the port-vector reads are serialized with rebuildAudioPorts() on the same thread.
+  void updateLatencyRanges();
+  // Fold auto-detected latency + user trim (ms) into the effective frame offsets (atomics
+  // read by the RT process callback) and republish the read-only latency metadata.
+  void recomputeEffectiveLatency();
+  // Publish effective + auto capture/playback latency (ms) as read-only JACK metadata.
+  void setLinkAudioLatencyProperties();
   void setBPMProperty(double bpm);
   void setEnableStartStopProperty(bool enable);
   void setSyncProperty(bool sync);
@@ -153,6 +165,24 @@ private:
   std::vector<jack_port_t*> mAudioOuts; // 2 * mNumStereoOutChannels ports
   std::atomic<bool> mChannelsChanged{false};
   bool mLinkAudioEnabled = false;
+
+  // I/O latency compensation. The send path stamps audio to the beat it was actually
+  // captured at (mTimeNext - capture latency); the receive path targets the beat the audio
+  // will actually be heard at (mTimeNext + playback latency). Effective = auto-detected from
+  // JACK + a per-direction user trim (covers converter/SPI latency JACK can't see and lets us
+  // correct the driver's guessed capture/playback split). Frame values are read in the RT
+  // process callback; recomputed non-RT whenever auto, trim, or sample rate changes.
+  std::atomic<jack_nframes_t> mAutoCaptureLatencyFrames{0};
+  std::atomic<jack_nframes_t> mAutoPlaybackLatencyFrames{0};
+  std::atomic<double> mCaptureLatencyTrimMs{0.0};
+  std::atomic<double> mPlaybackLatencyTrimMs{0.0};
+  std::atomic<jack_nframes_t> mEffCaptureLatencyFrames{0};
+  std::atomic<jack_nframes_t> mEffPlaybackLatencyFrames{0};
+  // Set by the latency callback (JACK notification thread) on graph/buffer-size changes; drained
+  // in processEvents (main thread), which reads the port latency ranges and republishes. Deferring
+  // off the notification thread avoids both racing rebuildAudioPorts() on the port vectors and the
+  // illegal jack_set_property-from-notification-thread call.
+  std::atomic<bool> mNeedsRecomputeLatency{false};
 
   // Per-receiver source filters — written from property/OSC callbacks, read in processEvents.
   // Empty string = any (auto). Guarded by mSourceFilterMutex.

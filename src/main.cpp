@@ -153,6 +153,20 @@ int main(int argc, char *argv[]) {
       .set_default("0")
       .help("Number of Link Audio stereo receive pairs, default: %default.");
 
+  parser.add_option("--capture-latency-trim-ms")
+      .type("double")
+      .dest("capture_latency_trim_ms")
+      .set_default("0.0")
+      .help("Trim (ms) added to JACK's auto-detected capture latency for Link Audio send "
+            "alignment; covers converter latency JACK can't see. default: %default.");
+
+  parser.add_option("--playback-latency-trim-ms")
+      .type("double")
+      .dest("playback_latency_trim_ms")
+      .set_default("0.0")
+      .help("Trim (ms) added to JACK's auto-detected playback latency for Link Audio receive "
+            "alignment; covers converter latency JACK can't see. default: %default.");
+
   // process args
   optparse::Values options = parser.parse_args(argc, argv);
   std::vector<std::string> args = parser.args();
@@ -219,6 +233,16 @@ int main(int argc, char *argv[]) {
       ? options["link_name"]
       : cfg.value("link_peer_name", std::string());
 
+  // Per-direction I/O latency trims (ms), added to JACK's auto-detected latency: CLI wins over config.
+  double captureLatencyTrimMs = options.is_set_by_user("capture_latency_trim_ms")
+      ? (double)options.get("capture_latency_trim_ms")
+      : cfg.value("link_audio_capture_latency_trim_ms",
+                  (double)options.get("capture_latency_trim_ms"));
+  double playbackLatencyTrimMs = options.is_set_by_user("playback_latency_trim_ms")
+      ? (double)options.get("playback_latency_trim_ms")
+      : cfg.value("link_audio_playback_latency_trim_ms",
+                  (double)options.get("playback_latency_trim_ms"));
+
   if (initialBPM <= 0.0 || initialQuantum < 1.0 || initialTimeSigDenom < 1.0 ||
       initialTicksPerBeat < 1.0) {
     std::cerr << "one or more numeric options are out of range" << std::endl;
@@ -238,7 +262,8 @@ int main(int argc, char *argv[]) {
                           enableLinkAudio, linkAudioInChannels,
                           linkAudioOutChannels,
                           initialSyncLink, configPath,
-                          sinkNames, sourceNames, linkPeerName);
+                          sinkNames, sourceNames, linkPeerName,
+                          captureLatencyTrimMs, playbackLatencyTrimMs);
       if (cfg.contains("source_filters"))
         j.applySourceFiltersFromConfig(cfg["source_filters"].dump());
 
