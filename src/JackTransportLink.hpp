@@ -191,8 +191,8 @@ private:
   // generators align with the incoming audio; when false, the transport runs live. The receive
   // buffer (mLatencyMs) is ALWAYS applied to incoming playout regardless of this toggle (network
   // buffers arrive late and need it) — this only gates the transport-BBT shift (timeBaseCallback).
-  // Default true.
-  std::atomic<bool> mSyncToIncomingAudio{true};
+  // Default false.
+  std::atomic<bool> mSyncToIncomingAudio{false};
   std::atomic<jack_nframes_t> mEffCaptureLatencyFrames{0};
   std::atomic<jack_nframes_t> mEffPlaybackLatencyFrames{0};
   // Set by the latency callback (JACK notification thread) on graph/buffer-size changes; drained

@@ -1216,8 +1216,8 @@ void JackTransportLink::propertyChangeCallback(jack_uuid_t subject,
         mNeedsSaveConfig = true;
       }
       if (issync) {
-        // clearing reverts to the default (on); republish so clients reflect it
-        mSyncToIncomingAudio.store(true, std::memory_order_release);
+        // clearing reverts to the default (off); republish so clients reflect it
+        mSyncToIncomingAudio.store(false, std::memory_order_release);
         mNeedsPublishSyncToIncoming.store(true, std::memory_order_release);
         mNeedsSaveConfig = true;
       }

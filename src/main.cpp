@@ -174,12 +174,12 @@ int main(int argc, char *argv[]) {
       .help("Link Audio receiver playout buffer in milliseconds (converted to beats at the "
             "current tempo), range 0-2000. default: %default.");
 
-  parser.set_defaults("sync_to_incoming", "1");
+  parser.set_defaults("sync_to_incoming", "0");
   parser.add_option("--sync-to-incoming")
       .action("store_true")
       .dest("sync_to_incoming")
       .help("Sync to Incoming Audio: delay the local transport timeline by the receive buffer so "
-            "transport-locked generators align with incoming audio (enabled by default). The "
+            "transport-locked generators align with incoming audio (disabled by default). The "
             "receive buffer is always applied regardless of this option.");
   parser.add_option("--no-sync-to-incoming")
       .action("store_false")
