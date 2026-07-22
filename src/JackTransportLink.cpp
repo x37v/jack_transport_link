@@ -1676,7 +1676,25 @@ void JackTransportLink::ProcessMessage(
           jack_transport_stop(mJackClient);
         }
       }
-    } else if (std::strcmp("/jacklink/linkaudio/peer-name", m.AddressPattern()) == 0) {
+    } else if (std::strcmp("/jacklink/start-stop-sync", m.AddressPattern()) == 0) {
+      if (arg != m.ArgumentsEnd() && arg->IsBool()) {
+        bool v = arg->AsBoolUnchecked();
+        mLink.enableStartStopSync(v);
+        setEnableStartStopProperty(v);
+        mNeedsSaveConfig = true;
+      }
+    } else if (std::strcmp("/jacklink/enabled", m.AddressPattern()) == 0) {
+      // mLink.enable() isn't RT-safe, so defer the actual toggle to processEvents.
+      if (arg != m.ArgumentsEnd() && arg->IsBool()) {
+        bool v = arg->AsBoolUnchecked();
+        if (v != mLinkEnabledDesired.load(std::memory_order_acquire)) {
+          mLinkEnabledDesired.store(v, std::memory_order_release);
+          mNeedsApplyLinkEnabled.store(true, std::memory_order_release);
+          mNeedsSaveConfig = true;
+        }
+        setLinkEnabledProperty();
+      }
+    } else if (std::strcmp("/jacklink/audio/peer-name", m.AddressPattern()) == 0) {
       // Non-empty sets the override; empty string clears it (reverts to hostname).
       // Unlike JACK metadata, OSC can carry an empty string, so we handle it here.
       if (arg != m.ArgumentsEnd() && arg->IsString()) {
@@ -1684,8 +1702,29 @@ void JackTransportLink::ProcessMessage(
         mNeedsApplyPeerName.store(true, std::memory_order_release);
         mNeedsSaveConfig = true;
       }
+    } else if (std::strcmp("/jacklink/audio/latency", m.AddressPattern()) == 0) {
+      if (arg != m.ArgumentsEnd()) {
+        std::optional<double> v = GetOscDouble(*arg);
+        if (v) {
+          const double clamped = clampLatencyMs(*v);
+          if (clamped != mLatencyMs.load(std::memory_order_acquire)) {
+            mLatencyMs.store(clamped, std::memory_order_release);
+            mNeedsSaveConfig = true;
+          }
+          setLinkAudioLatencyMsProperty();
+        }
+      }
+    } else if (std::strcmp("/jacklink/audio/sync-to-incoming", m.AddressPattern()) == 0) {
+      if (arg != m.ArgumentsEnd() && arg->IsBool()) {
+        bool v = arg->AsBoolUnchecked();
+        if (v != mSyncToIncomingAudio.load(std::memory_order_acquire)) {
+          mSyncToIncomingAudio.store(v, std::memory_order_release);
+          mNeedsSaveConfig = true;
+        }
+        setLinkAudioSyncToIncomingProperty();
+      }
     } else if (mLinkAudioEnabled &&
-               std::strcmp("/jacklink/linkaudio/source", m.AddressPattern()) == 0) {
+               std::strcmp("/jacklink/audio/source", m.AddressPattern()) == 0) {
       // pairs: peer0 channel0 peer1 channel1 ...
       bool changed = false;
       {
@@ -1705,8 +1744,8 @@ void JackTransportLink::ProcessMessage(
         mNeedsSaveConfig = true;
       }
     } else if (mLinkAudioEnabled
-               && parseOscNameIndex(m.AddressPattern(), "/jacklink/linkaudio/source/", "/name") >= 0) {
-      long idx = parseOscNameIndex(m.AddressPattern(), "/jacklink/linkaudio/source/", "/name");
+               && parseOscNameIndex(m.AddressPattern(), "/jacklink/audio/source/", "/name") >= 0) {
+      long idx = parseOscNameIndex(m.AddressPattern(), "/jacklink/audio/source/", "/name");
       if (static_cast<size_t>(idx) < mSourceNames.size()
           && arg != m.ArgumentsEnd() && arg->IsString()) {
         mSourceNames[static_cast<size_t>(idx)] = arg->AsStringUnchecked();
@@ -1714,8 +1753,8 @@ void JackTransportLink::ProcessMessage(
         mNeedsSaveConfig = true;
       }
     } else if (mLinkAudioEnabled
-               && parseOscNameIndex(m.AddressPattern(), "/jacklink/linkaudio/sink/", "/name") >= 0) {
-      long idx = parseOscNameIndex(m.AddressPattern(), "/jacklink/linkaudio/sink/", "/name");
+               && parseOscNameIndex(m.AddressPattern(), "/jacklink/audio/sink/", "/name") >= 0) {
+      long idx = parseOscNameIndex(m.AddressPattern(), "/jacklink/audio/sink/", "/name");
       if (static_cast<size_t>(idx) < mSinkNames.size()
           && arg != m.ArgumentsEnd() && arg->IsString()) {
         mSinkNames[static_cast<size_t>(idx)] = arg->AsStringUnchecked();
@@ -1724,9 +1763,9 @@ void JackTransportLink::ProcessMessage(
         mNeedsSaveConfig = true;
       }
     } else if (mLinkAudioEnabled
-               && std::strncmp("/jacklink/linkaudio/source/", m.AddressPattern(),
-                                sizeof("/jacklink/linkaudio/source/") - 1) == 0) {
-      const char* idxStr = m.AddressPattern() + sizeof("/jacklink/linkaudio/source/") - 1;
+               && std::strncmp("/jacklink/audio/source/", m.AddressPattern(),
+                                sizeof("/jacklink/audio/source/") - 1) == 0) {
+      const char* idxStr = m.AddressPattern() + sizeof("/jacklink/audio/source/") - 1;
       char* end;
       long idx = std::strtol(idxStr, &end, 10);
       if (*end == '\0' && idx >= 0
@@ -1745,14 +1784,14 @@ void JackTransportLink::ProcessMessage(
         mNeedsSaveConfig = true;
       }
     } else if (mLinkAudioEnabled &&
-               std::strcmp("/jacklink/linkaudio/in-stereo-channels", m.AddressPattern()) == 0) {
+               std::strcmp("/jacklink/audio/in-stereo-channels", m.AddressPattern()) == 0) {
       if (arg != m.ArgumentsEnd()) {
         auto v = GetOscDouble(*arg);
         if (v && *v >= 0.0 && *v <= kMaxLinkAudioStereoPairs)
           mRequestedStereoInChannels.store(static_cast<int>(*v));
       }
     } else if (mLinkAudioEnabled &&
-               std::strcmp("/jacklink/linkaudio/out-stereo-channels", m.AddressPattern()) == 0) {
+               std::strcmp("/jacklink/audio/out-stereo-channels", m.AddressPattern()) == 0) {
       if (arg != m.ArgumentsEnd()) {
         auto v = GetOscDouble(*arg);
         if (v && *v >= 0.0 && *v <= kMaxLinkAudioStereoPairs)
