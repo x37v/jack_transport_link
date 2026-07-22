@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.16...3.31)
 
 include(FetchContent)
 
-set(PROJECT_VERSION "0.0.13")
+set(PROJECT_VERSION "0.0.14")
 set(CPACK_DEBIAN_PACKAGE_RELEASE 1) #set to 1 if we inc PROJECT_VERSION, incr if we need to package new with same PROJECT_VERSION
 
 project(jack_transport_link
