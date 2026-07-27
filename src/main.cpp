@@ -17,8 +17,18 @@
 static std::string defaultConfigPath() {
   namespace fs = std::filesystem;
   const char* xdg = std::getenv("XDG_CONFIG_HOME");
-  fs::path base = xdg ? fs::path(xdg)
-                      : fs::path(std::getenv("HOME")) / ".config";
+  fs::path base;
+  if (xdg && *xdg) {
+    base = fs::path(xdg);
+  } else {
+    const char* home = std::getenv("HOME");
+    if (!home || !*home) {
+      std::cerr << "warning: HOME and XDG_CONFIG_HOME are unset; "
+                   "automatic config persistence is disabled\n";
+      return {};
+    }
+    base = fs::path(home) / ".config";
+  }
   return (base / "jack-transport-link" / "config.json").string();
 }
 
@@ -26,10 +36,31 @@ static nlohmann::json loadConfig(const std::string& path) {
   std::ifstream f(path);
   if (!f.is_open()) return nlohmann::json::object();
   try {
-    return nlohmann::json::parse(f);
+    auto config = nlohmann::json::parse(f);
+    if (!config.is_object()) {
+      std::cerr << "warning: config " << path
+                << " must contain a JSON object, ignoring\n";
+      return nlohmann::json::object();
+    }
+    return config;
   } catch (...) {
     std::cerr << "warning: failed to parse config " << path << ", ignoring\n";
     return nlohmann::json::object();
+  }
+}
+
+template <typename T>
+static T configValue(const nlohmann::json& config, const char* key,
+                     T fallback) {
+  const auto it = config.find(key);
+  if (it == config.end())
+    return fallback;
+  try {
+    return it->get<T>();
+  } catch (const nlohmann::json::exception&) {
+    std::cerr << "warning: config key \"" << key
+              << "\" has the wrong type, using the default\n";
+    return fallback;
   }
 }
 
@@ -219,34 +250,43 @@ int main(int argc, char *argv[]) {
 
   auto cfgDouble = [&](const char* key, double fallback) -> double {
     return options.is_set_by_user(key) ? (double)options.get(key)
-                                       : cfg.value(key, (double)options.get(key));
+                                       : configValue(cfg, key, fallback);
   };
 
   bool enableStartStopSync = options.is_set_by_user("start_stop_sync")
       ? (bool)options.get("start_stop_sync")
-      : cfg.value("start_stop_sync", (bool)options.get("start_stop_sync"));
+      : configValue(cfg, "start_stop_sync",
+                    (bool)options.get("start_stop_sync"));
   double initialBPM        = cfgDouble("bpm",     100.0);
   double initialQuantum    = cfgDouble("quantum",   4.0);
   float  initialTimeSigDenom = options.is_set_by_user("denom")
       ? (float)(double)options.get("denom")
-      : (float)cfg.value("time_sig_denom", (double)options.get("denom"));
+      : (float)configValue(cfg, "time_sig_denom",
+                           (double)options.get("denom"));
   double initialTicksPerBeat = options.is_set_by_user("ticks")
       ? (double)options.get("ticks")
-      : cfg.value("ticks_per_beat", (double)options.get("ticks"));
+      : configValue(cfg, "ticks_per_beat", (double)options.get("ticks"));
   std::string name = options["name"];
   int oscport = options.get("oscport");
   bool enableLinkAudio = options.is_set_by_user("link_audio")
       ? static_cast<bool>(options.get("link_audio"))
-      : cfg.value("link_audio_enabled", static_cast<bool>(options.get("link_audio")));
-  size_t linkAudioInChannels = options.is_set_by_user("link_audio_in_stereo_channels")
-      ? static_cast<size_t>(static_cast<int>(options.get("link_audio_in_stereo_channels")))
-      : static_cast<size_t>(cfg.value("in_stereo_channels",
-            static_cast<int>(options.get("link_audio_in_stereo_channels"))));
-  size_t linkAudioOutChannels = options.is_set_by_user("link_audio_out_stereo_channels")
-      ? static_cast<size_t>(static_cast<int>(options.get("link_audio_out_stereo_channels")))
-      : static_cast<size_t>(cfg.value("out_stereo_channels",
-            static_cast<int>(options.get("link_audio_out_stereo_channels"))));
-  bool initialSyncLink = cfg.value("sync", true);
+      : configValue(cfg, "link_audio_enabled",
+                    static_cast<bool>(options.get("link_audio")));
+  const int linkAudioInChannelsValue =
+      options.is_set_by_user("link_audio_in_stereo_channels")
+          ? static_cast<int>(options.get("link_audio_in_stereo_channels"))
+          : configValue(
+                cfg, "in_stereo_channels",
+                static_cast<int>(
+                    options.get("link_audio_in_stereo_channels")));
+  const int linkAudioOutChannelsValue =
+      options.is_set_by_user("link_audio_out_stereo_channels")
+          ? static_cast<int>(options.get("link_audio_out_stereo_channels"))
+          : configValue(
+                cfg, "out_stereo_channels",
+                static_cast<int>(
+                    options.get("link_audio_out_stereo_channels")));
+  bool initialSyncLink = configValue(cfg, "sync", true);
 
   auto loadNames = [&](const char* key) -> std::vector<std::string> {
     std::vector<std::string> out;
@@ -262,32 +302,41 @@ int main(int argc, char *argv[]) {
   // Link peer-name override (empty = auto/hostname): CLI wins over config.
   std::string linkPeerName = options.is_set_by_user("link_name")
       ? options["link_name"]
-      : cfg.value("link_peer_name", std::string());
+      : configValue(cfg, "link_peer_name", std::string());
 
   // Per-direction I/O latency trims (ms), added to JACK's auto-detected latency: CLI wins over config.
   double captureLatencyTrimMs = options.is_set_by_user("capture_latency_trim_ms")
       ? (double)options.get("capture_latency_trim_ms")
-      : cfg.value("link_audio_capture_latency_trim_ms",
-                  (double)options.get("capture_latency_trim_ms"));
+      : configValue(cfg, "link_audio_capture_latency_trim_ms",
+                    (double)options.get("capture_latency_trim_ms"));
   double playbackLatencyTrimMs = options.is_set_by_user("playback_latency_trim_ms")
       ? (double)options.get("playback_latency_trim_ms")
-      : cfg.value("link_audio_playback_latency_trim_ms",
-                  (double)options.get("playback_latency_trim_ms"));
+      : configValue(cfg, "link_audio_playback_latency_trim_ms",
+                    (double)options.get("playback_latency_trim_ms"));
   double latencyMs = options.is_set_by_user("latency_ms")
       ? (double)options.get("latency_ms")
-      : cfg.value("link_audio_latency_ms", (double)options.get("latency_ms"));
+      : configValue(cfg, "link_audio_latency_ms",
+                    (double)options.get("latency_ms"));
   bool syncToIncomingAudio = options.is_set_by_user("sync_to_incoming")
       ? (bool)options.get("sync_to_incoming")
-      : cfg.value("link_audio_sync_to_incoming", (bool)options.get("sync_to_incoming"));
+      : configValue(cfg, "link_audio_sync_to_incoming",
+                    (bool)options.get("sync_to_incoming"));
   bool linkEnabled = options.is_set_by_user("link_enabled")
       ? (bool)options.get("link_enabled")
-      : cfg.value("link_enabled", (bool)options.get("link_enabled"));
+      : configValue(cfg, "link_enabled",
+                    (bool)options.get("link_enabled"));
 
   if (initialBPM <= 0.0 || initialQuantum < 1.0 || initialTimeSigDenom < 1.0 ||
-      initialTicksPerBeat < 1.0) {
+      initialTicksPerBeat < 1.0 || linkAudioInChannelsValue < 0 ||
+      linkAudioInChannelsValue > 64 || linkAudioOutChannelsValue < 0 ||
+      linkAudioOutChannelsValue > 64) {
     std::cerr << "one or more numeric options are out of range" << std::endl;
     return -1;
   }
+  const size_t linkAudioInChannels =
+      static_cast<size_t>(linkAudioInChannelsValue);
+  const size_t linkAudioOutChannels =
+      static_cast<size_t>(linkAudioOutChannelsValue);
 
   std::unique_ptr<oscpack::UdpListeningReceiveSocket> oscsocket;
   while (run.load()) {

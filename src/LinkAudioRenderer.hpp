@@ -1,10 +1,16 @@
 #pragma once
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
 
 #if defined(LINK_AUDIO)
 
@@ -12,6 +18,10 @@
 #include <ableton/link_audio/Buffer.hpp>
 #include <ableton/link_audio/Queue.hpp>
 #include <ableton/util/FloatIntConversion.hpp>
+
+static_assert(std::atomic<float>::is_always_lock_free);
+static_assert(std::atomic<uint32_t>::is_always_lock_free);
+static_assert(std::atomic<size_t>::is_always_lock_free);
 
 namespace ableton {
 namespace linkaudio {
@@ -44,7 +54,7 @@ public:
         mSink(mLink, std::move(name), 4096 * numChannels),
         mSampleRate(sampleRate) {}
 
-  void send(double *const *ppChannels, size_t numFrames,
+  void send(const float *const *ppChannels, size_t numFrames,
             typename Link::SessionState sessionState, double sampleRate,
             const std::chrono::microseconds hostTime, double quantum) {
     auto buffer = LinkAudioSink::BufferHandle(mSink);
@@ -77,8 +87,7 @@ template <typename Link> class LinkAudioSourceRenderer {
 
 public:
   LinkAudioSourceRenderer(Link &link, size_t numChannels, double &sampleRate)
-      : mLink(link), mNumChannels(numChannels), mSampleRate(sampleRate),
-        mReceiverSampleCaches(numChannels, {0.0, 0.0, 0.0, 0.0}) {
+      : mLink(link), mNumChannels(numChannels), mSampleRate(sampleRate) {
     Buffer proto;
     proto.mSamples.resize(1024 * 8);
     auto queue = Queue(2048, proto);
@@ -90,7 +99,7 @@ public:
 
   ~LinkAudioSourceRenderer() { mpSource.reset(); }
 
-  void receive(double *const *ppChannels, size_t numFrames,
+  void receive(float *const *ppChannels, size_t numFrames,
                typename Link::SessionState sessionState, double sampleRate,
                const std::chrono::microseconds hostTime, double quantum,
                double latencyMs) {
@@ -146,7 +155,6 @@ public:
       if (wasRendering)
         mDropoutCount.fetch_add(1, std::memory_order_relaxed);
       silenceOutputs();
-      moLastFrameIdx = std::nullopt;
       moStartReadPos = std::nullopt;
       mBuffered = 0;
       return;
@@ -159,7 +167,6 @@ public:
       // playout cursor. Preserve it and output pre-roll silence until the
       // target window catches up.
       silenceOutputs();
-      moLastFrameIdx = std::nullopt;
       moStartReadPos = std::nullopt;
       mBuffered = 0;
       return;
@@ -207,7 +214,6 @@ public:
       if (wasRendering)
         mDropoutCount.fetch_add(1, std::memory_order_relaxed);
       silenceOutputs();
-      moLastFrameIdx = std::nullopt;
       moStartReadPos = std::nullopt;
       mBuffered = 0;
       return;
@@ -219,7 +225,6 @@ public:
       if (wasRendering)
         mDropoutCount.fetch_add(1, std::memory_order_relaxed);
       silenceOutputs();
-      moLastFrameIdx = std::nullopt;
       moStartReadPos = std::nullopt;
       mBuffered = 0;
       return;
@@ -256,49 +261,43 @@ public:
       const auto frameIdx = static_cast<size_t>(std::floor(framePos));
       const auto t = framePos - std::floor(framePos);
 
-      // Advance each channel's four-sample history to the integer source frame
-      // surrounding this output sample. frameIncrement may be above or below
-      // one, so this can advance multiple source frames or reuse the existing
-      // history.
-      while (!moLastFrameIdx ||
-             (moLastFrameIdx && frameIdx > *moLastFrameIdx)) {
-        for (size_t ch = 0; ch < mNumChannels; ++ch) {
-          auto &cache = mReceiverSampleCaches[ch];
-          cache[3] = cache[2];
-          cache[2] = cache[1];
-          cache[1] = cache[0];
-          cache[0] = (ch < srcChannels)
-                         ? ((frameIdx > 0) ? getSample(frameIdx - 1, ch)
-                                           : getSample(0, ch))
-                         : 0.0;
-        }
-        moLastFrameIdx = moLastFrameIdx ? (*moLastFrameIdx + 1) : frameIdx;
-      }
-
+      // Catmull-Rom interpolation expects chronological samples, with t moving
+      // from p[1] (frameIdx) toward p[2] (frameIdx + 1). Clamp the look-behind
+      // at stream start; getSample supplies silence beyond retained look-ahead.
       for (size_t ch = 0; ch < mNumChannels; ++ch) {
-        ppChannels[ch][frame] =
-            (ch < srcChannels) ? cubicInterpolate(mReceiverSampleCaches[ch], t)
-                               : 0.0;
+        if (ch < srcChannels) {
+          const auto previousIdx = frameIdx > 0 ? frameIdx - 1 : 0;
+          const std::array<double, 4> samples{
+              getSample(previousIdx, ch), getSample(frameIdx, ch),
+              getSample(frameIdx + 1, ch), getSample(frameIdx + 2, ch)};
+          ppChannels[ch][frame] =
+              static_cast<float>(cubicInterpolate(samples, t));
+        } else {
+          ppChannels[ch][frame] = 0.0;
+        }
       }
 
-      const auto &currentInfo = (*mpQueueReader)[0]->mInfo;
-      if (frameIdx >= currentInfo.numFrames) {
-        // Rebase all persistent positions onto the next queue slot before
-        // releasing the current one; the next process callback can then
-        // continue without a discontinuity.
-        readPos -= double(currentInfo.numFrames);
-        moLastFrameIdx = frameIdx - currentInfo.numFrames;
+      // Release every complete slot passed by this sample and rebase readPos
+      // onto the new head. Keep the slot containing the target endpoint.
+      auto consumedFrameIdx = frameIdx;
+      while (mpQueueReader->numRetainedSlots() > 1) {
+        const auto headFrames = (*mpQueueReader)[0]->mInfo.numFrames;
+        if (consumedFrameIdx < headFrames)
+          break;
+        readPos -= double(headFrames);
+        consumedFrameIdx -= headFrames;
         mpQueueReader->releaseSlot();
       }
     }
 
     *moStartReadPos = readPos + double(numFrames) * frameIncrement;
 
-    // Publish the unread queue duration for non-real-time health reporting.
-    // Subtract the fractional cursor already consumed from the head, then add
-    // each remaining complete slot.
-    auto buffered = -static_cast<float>(*moStartReadPos) /
-                    float((*mpQueueReader)[0]->mInfo.sampleRate);
+    // Publish the unread queue duration: the unconsumed portion of the head
+    // plus every remaining complete slot.
+    const auto &headInfo = (*mpQueueReader)[0]->mInfo;
+    auto buffered = static_cast<float>(
+        std::max(0.0, double(headInfo.numFrames) - *moStartReadPos) /
+        double(headInfo.sampleRate));
     for (auto i = 1u; i < mpQueueReader->numRetainedSlots(); ++i) {
       const auto &info = (*mpQueueReader)[i]->mInfo;
       buffered += float(info.numFrames) / float(info.sampleRate);
@@ -326,7 +325,6 @@ public:
         mpQueueReader->releaseSlot();
       }
 
-      moLastFrameIdx = std::nullopt;
       moStartReadPos = std::nullopt;
 
       // Reset health to a clean per-connection slate. Safe here: mpSource is
@@ -399,9 +397,6 @@ private:
 
   std::shared_ptr<typename Queue::Writer> mpQueueWriter;
   std::shared_ptr<typename Queue::Reader> mpQueueReader;
-
-  std::vector<std::array<double, 4>> mReceiverSampleCaches;
-  std::optional<size_t> moLastFrameIdx = std::nullopt;
 };
 
 } // namespace linkaudio
@@ -416,7 +411,7 @@ template <typename Link> class LinkAudioSinkRenderer {
 public:
   LinkAudioSinkRenderer(Link &, std::string, size_t, double &) {}
 
-  void send(double *const *, size_t, typename Link::SessionState, double,
+  void send(const float *const *, size_t, typename Link::SessionState, double,
             const std::chrono::microseconds, double) {}
 };
 
@@ -424,7 +419,7 @@ template <typename Link> class LinkAudioSourceRenderer {
 public:
   LinkAudioSourceRenderer(Link &, size_t, double &) {}
 
-  void receive(double *const *, size_t numFrames, typename Link::SessionState,
+  void receive(float *const *, size_t numFrames, typename Link::SessionState,
                double, const std::chrono::microseconds, double, double) {}
 
   bool hasSource() const { return false; }

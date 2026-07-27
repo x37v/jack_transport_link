@@ -232,7 +232,7 @@ JackTransportLink::JackTransportLink(jack_client_t *client,
       mNumStereoInChannels(linkAudioStereoInChannels),
       mNumStereoOutChannels(linkAudioStereoOutChannels),
       mLinkPeerName(std::move(linkPeerName)),
-      mBPM(initialBPM), mQuantum(initialQuantum),
+      mBPM(initialBPM), mLinkBPM(initialBPM), mQuantum(initialQuantum),
       mInitialQuantum(initialQuantum),
       mInitialTimeSigDenom(initialTimeSigDenom),
       mInitialTicksPerBeat(initialTicksPerBeat),
@@ -255,15 +255,16 @@ JackTransportLink::JackTransportLink(jack_client_t *client,
 
   // setup link
   mLink.setTempoCallback([this](double bpm) {
-    mLinkBPM = bpm;
-    if (mSyncLink) {
+    mLinkBPM.store(bpm, std::memory_order_release);
+    if (mSyncLink.load(std::memory_order_acquire)) {
       mBPM.store(bpm, std::memory_order_release);
-      mReportBPM = true;
+      mReportBPM.store(true, std::memory_order_release);
     }
   });
   if (enableStartStopSync) {
     mLink.setStartStopCallback([this](bool isPlaying) {
-      if (mLink.isStartStopSyncEnabled() && mSyncLink) {
+      if (mLink.isStartStopSyncEnabled() &&
+          mSyncLink.load(std::memory_order_acquire)) {
         if (isPlaying) {
           jack_transport_start(mJackClient);
         } else {
@@ -288,7 +289,7 @@ JackTransportLink::JackTransportLink(jack_client_t *client,
         jack_uuid_parse(uuids, &mJackClientUUID) == 0) {
       setBPMProperty(mBPM.load(std::memory_order_acquire));
       setEnableStartStopProperty(mLink.isStartStopSyncEnabled());
-      setSyncProperty(mSyncLink);
+      setSyncProperty(mSyncLink.load(std::memory_order_acquire));
       setLinkEnabledProperty();
       setNumPeersProperty(mLink.numPeers());
       // publish the effective Link peer name (always non-empty: override or hostname)
@@ -336,13 +337,6 @@ JackTransportLink::JackTransportLink(jack_client_t *client,
     mCurrentSourceChannelNames.resize(mNumStereoOutChannels);
     mLinkAudioPeerFilters.resize(mNumStereoOutChannels);
     mLinkAudioChannelFilters.resize(mNumStereoOutChannels);
-
-    jack_nframes_t bufSize = jack_get_buffer_size(mJackClient);
-    mStereoSendBuf.resize(mNumStereoInChannels * 2 * bufSize);
-    mStereoRecvBuf.resize(mNumStereoOutChannels * 2 * bufSize);
-
-    jack_set_buffer_size_callback(mJackClient,
-                                  JackTransportLink::bufferSizeCallback, this);
 
     mAudioIns.resize(2 * mNumStereoInChannels);
     mAudioOuts.resize(2 * mNumStereoOutChannels);
@@ -400,22 +394,15 @@ JackTransportLink::JackTransportLink(jack_client_t *client,
 JackTransportLink::~JackTransportLink() {
   // flush any config change that the debounce in processEvents hasn't written yet,
   // so a clean exit (e.g. Ctrl-C) doesn't lose recent changes
-  if (mNeedsSaveConfig)
-    saveConfig();
+  {
+    std::lock_guard<std::recursive_mutex> lock(mControlMutex);
+    if (mNeedsSaveConfig.load(std::memory_order_acquire))
+      saveConfig();
+  }
   jack_set_sync_callback(mJackClient, nullptr, nullptr);
   jack_release_timebase(mJackClient);
   jack_deactivate(mJackClient);
   jack_client_close(mJackClient);
-}
-
-int JackTransportLink::bufferSizeCallback(jack_nframes_t nframes, void *arg) {
-  return static_cast<JackTransportLink *>(arg)->bufferSizeCallback(nframes);
-}
-
-int JackTransportLink::bufferSizeCallback(jack_nframes_t nframes) {
-  mStereoSendBuf.resize(mNumStereoInChannels * 2 * nframes);
-  mStereoRecvBuf.resize(mNumStereoOutChannels * 2 * nframes);
-  return 0;
 }
 
 void JackTransportLink::latencyCallback(jack_latency_callback_mode_t, void *arg) {
@@ -489,6 +476,7 @@ void JackTransportLink::setLinkAudioLatencyProperties() {
 }
 
 void JackTransportLink::processEvents() {
+  std::lock_guard<std::recursive_mutex> lock(mControlMutex);
   {
     int reqIn  = mRequestedStereoInChannels.exchange(-1, std::memory_order_acq_rel);
     int reqOut = mRequestedStereoOutChannels.exchange(-1, std::memory_order_acq_rel);
@@ -509,16 +497,13 @@ void JackTransportLink::processEvents() {
     if (mNeedsSourceUpdate.exchange(false, std::memory_order_acq_rel)) {
       if (updateLinkAudioSource()) { mReportLinkAudioSource = true; mUpdatePortMeta = true; }
     }
-    if (mReportLinkAudioChannels) {
-      mReportLinkAudioChannels = false;
+    if (mReportLinkAudioChannels.exchange(false, std::memory_order_acq_rel)) {
       setLinkAudioChannelsProperty(mLink.channels());
     }
-    if (mReportLinkAudioSource) {
-      mReportLinkAudioSource = false;
+    if (mReportLinkAudioSource.exchange(false, std::memory_order_acq_rel)) {
       setLinkAudioSourceProperty();
     }
-    if (mReportLinkAudioSourceFilters) {
-      mReportLinkAudioSourceFilters = false;
+    if (mReportLinkAudioSourceFilters.exchange(false, std::memory_order_acq_rel)) {
       setLinkAudioSourceFiltersProperty();
       // the configured filter is the fallback source label, so refresh port names too
       mUpdatePortMeta = true;
@@ -557,22 +542,19 @@ void JackTransportLink::processEvents() {
   if (mNeedsPublishLinkEnabled.exchange(false, std::memory_order_acq_rel)) {
     setLinkEnabledProperty();
   }
-  if (mReportBPM) {
-    mReportBPM = false;
+  if (mReportBPM.exchange(false, std::memory_order_acq_rel)) {
     setBPMProperty(mBPM.load(std::memory_order_acquire));
   }
-  if (mReportLinkSync) {
-    mReportLinkSync = false;
-    setSyncProperty(mSyncLink);
+  if (mReportLinkSync.exchange(false, std::memory_order_acq_rel)) {
+    setSyncProperty(mSyncLink.load(std::memory_order_acquire));
   }
-  if (mReportStartStopEnable) {
-    mReportStartStopEnable = false;
+  if (mReportStartStopEnable.exchange(false, std::memory_order_acq_rel)) {
     setEnableStartStopProperty(mLink.isStartStopSyncEnabled());
   }
-  if (mNeedsSaveConfig) {
+  if (mNeedsSaveConfig.load(std::memory_order_acquire)) {
     auto now = std::chrono::steady_clock::now();
     if (now - mLastConfigSave >= std::chrono::seconds(1)) {
-      mNeedsSaveConfig = false;
+      mNeedsSaveConfig.store(false, std::memory_order_release);
       mLastConfigSave  = now;
       saveConfig();
     }
@@ -616,9 +598,10 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
   double beatrequest = -1.0;
 
   // if sync has changed, and we are now syncing, we request the beat we're at
-  if (mSyncLink != mWasSyncLink) {
-    mWasSyncLink = mSyncLink;
-    if (mSyncLink) {
+  const bool syncLink = mSyncLink.load(std::memory_order_acquire);
+  if (syncLink != mWasSyncLink) {
+    mWasSyncLink = syncLink;
+    if (syncLink) {
       beatrequest = mInternalBeat; // might already be equal from above
     }
   }
@@ -636,7 +619,7 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
   double bpm = mBPM.load(std::memory_order_acquire);
   bool bpmChange = bbtValid && pos.beats_per_minute != bpm;
   auto linkTime = mTimeNext; // now plus some latency
-  if (mSyncLink && (stateChange || bpmChange || beatrequest >= 0.0)) {
+  if (syncLink && (stateChange || bpmChange || beatrequest >= 0.0)) {
     bool havePeers = mLink.numPeers() > 0;
     auto sessionState = mLink.captureAudioSessionState();
     if (stateChange) {
@@ -867,22 +850,19 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
         mTimeNext + framesToUsec(mEffPlaybackLatencyFrames.load(std::memory_order_acquire));
 
     for (size_t i = 0; i < mNumStereoInChannels; ++i) {
-      double* sendPtrs[2];
-      for (size_t ch = 0; ch < 2; ++ch) {
-        sendPtrs[ch] = mStereoSendBuf.data() + (i * 2 + ch) * nframes;
-        const auto *inBuf = static_cast<const float *>(
+      const float* sendPtrs[2];
+      for (size_t ch = 0; ch < 2; ++ch)
+        sendPtrs[ch] = static_cast<const float *>(
             jack_port_get_buffer(mAudioIns[i * 2 + ch], nframes));
-        for (jack_nframes_t f = 0; f < nframes; ++f)
-          sendPtrs[ch][f] = static_cast<double>(inBuf[f]);
-      }
       mSendRenderers[i]->send(sendPtrs, nframes, sessionState,
                               mSampleRate, sendHostTime, mQuantum);
     }
 
     for (size_t i = 0; i < mNumStereoOutChannels; ++i) {
-      double* recvPtrs[2];
+      float* recvPtrs[2];
       for (size_t ch = 0; ch < 2; ++ch)
-        recvPtrs[ch] = mStereoRecvBuf.data() + (i * 2 + ch) * nframes;
+        recvPtrs[ch] = static_cast<float *>(
+            jack_port_get_buffer(mAudioOuts[i * 2 + ch], nframes));
       // The streaming playout buffer always applies to received audio — network buffers arrive
       // late, so without it there is nothing to play (the live-beat target drops every buffer as
       // too old). "Sync to Incoming Audio" does NOT gate this; it only decides whether the local
@@ -891,12 +871,6 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
       mRecvRenderers[i]->receive(recvPtrs, nframes, sessionState,
                                  mSampleRate, recvHostTime, mQuantum,
                                  mLatencyMs.load(std::memory_order_acquire));
-      for (size_t ch = 0; ch < 2; ++ch) {
-        auto *outBuf = static_cast<float *>(
-            jack_port_get_buffer(mAudioOuts[i * 2 + ch], nframes));
-        for (jack_nframes_t f = 0; f < nframes; ++f)
-          outBuf[f] = static_cast<float>(recvPtrs[ch][f]);
-      }
     }
   }
 
@@ -923,7 +897,7 @@ void JackTransportLink::timeBaseCallback(jack_transport_state_t transportState,
   double ticksPerBeat = bbtValid ? pos->ticks_per_beat : mInitialTicksPerBeat;
 
   auto linkTime = mTime;
-  auto sync = mSyncLink;
+  const bool sync = mSyncLink.load(std::memory_order_acquire);
 
   if (sync) {
     mInternalBeat = sessionState.beatAtTime(linkTime, mQuantum);
@@ -1023,6 +997,7 @@ void JackTransportLink::propertyChangeCallback(jack_uuid_t subject,
 void JackTransportLink::propertyChangeCallback(jack_uuid_t subject,
                                                const char *key,
                                                jack_property_change_t change) {
+  std::lock_guard<std::recursive_mutex> lock(mControlMutex);
   // if the subject is all or us and the key is all (empty) or bpm
   if ((jack_uuid_empty(subject) || subject == mJackClientUUID)) {
     bool isbpm = !key || bpm_key.compare(key) == 0;
@@ -1060,12 +1035,14 @@ void JackTransportLink::propertyChangeCallback(jack_uuid_t subject,
       } else if (islinksync &&
                  get_property(mJackClientUUID, linksync_key, values, types)) {
 
-        bool was = mSyncLink;
-        mSyncLink = std::find(true_values.begin(), true_values.end(), values) !=
-                    true_values.end();
+        const bool was = mSyncLink.load(std::memory_order_acquire);
+        const bool sync = std::find(true_values.begin(), true_values.end(), values) !=
+                          true_values.end();
+        mSyncLink.store(sync, std::memory_order_release);
 
-        if (mSyncLink && !was) {
-          mBPM.store(mLinkBPM, std::memory_order_release);
+        if (sync && !was) {
+          mBPM.store(mLinkBPM.load(std::memory_order_acquire),
+                     std::memory_order_release);
           mReportBPM = true;
         }
         mNeedsSaveConfig = true;
@@ -1364,6 +1341,7 @@ void JackTransportLink::setLinkAudioSourceFiltersProperty() {
 }
 
 std::string JackTransportLink::effectiveSinkName(size_t i) const {
+  std::lock_guard<std::recursive_mutex> lock(mControlMutex);
   if (i < mSinkNames.size() && !mSinkNames[i].empty())
     return mSinkNames[i];
   return "Send " + std::to_string(i + 1);
@@ -1372,6 +1350,7 @@ std::string JackTransportLink::effectiveSinkName(size_t i) const {
 // Effective Link peer name: the user override if set, otherwise the device hostname.
 // Link truncates names beyond 256 chars; the hostname buffer bounds us well under that.
 std::string JackTransportLink::effectiveLinkPeerName() const {
+  std::lock_guard<std::recursive_mutex> lock(mControlMutex);
   if (!mLinkPeerName.empty())
     return mLinkPeerName;
   char host[256];
@@ -1440,11 +1419,13 @@ void JackTransportLink::setLinkAudioSlotNameProperty(const std::string& key, con
 }
 
 void JackTransportLink::setLinkAudioSinkNameProperty(size_t i) {
+  std::lock_guard<std::recursive_mutex> lock(mControlMutex);
   if (i >= mSinkNames.size()) return;
   setLinkAudioSlotNameProperty(linkaudio_sink_key + "/" + std::to_string(i) + "/name", mSinkNames[i]);
 }
 
 void JackTransportLink::setLinkAudioSourceNameProperty(size_t i) {
+  std::lock_guard<std::recursive_mutex> lock(mControlMutex);
   if (i >= mSourceNames.size()) return;
   setLinkAudioSlotNameProperty(linkaudio_source_key + "/" + std::to_string(i) + "/name", mSourceNames[i]);
 }
@@ -1628,6 +1609,7 @@ void JackTransportLink::invalidateClockSyncBBT() {
 void JackTransportLink::ProcessMessage(
     const oscpack::ReceivedMessage &m,
     const oscpack::IpEndpointName &remoteEndpoint) {
+  std::lock_guard<std::recursive_mutex> lock(mControlMutex);
   try {
     oscpack::ReceivedMessageArgumentStream args = m.ArgumentStream();
     oscpack::ReceivedMessage::const_iterator arg = m.ArgumentsBegin();
@@ -1658,13 +1640,15 @@ void JackTransportLink::ProcessMessage(
       }
     } else if (std::strcmp("/jacklink/sync", m.AddressPattern()) == 0) {
       if (arg != m.ArgumentsEnd() && arg->IsBool()) {
-        bool was = mSyncLink;
-        mSyncLink = arg->AsBoolUnchecked();
-        if (mSyncLink && !was) {
-          mBPM.store(mLinkBPM, std::memory_order_release);
+        const bool was = mSyncLink.load(std::memory_order_acquire);
+        const bool sync = arg->AsBoolUnchecked();
+        mSyncLink.store(sync, std::memory_order_release);
+        if (sync && !was) {
+          mBPM.store(mLinkBPM.load(std::memory_order_acquire),
+                     std::memory_order_release);
           mReportBPM = true;
         }
-        setSyncProperty(mSyncLink);
+        setSyncProperty(sync);
         mNeedsSaveConfig = true;
       }
     } else if (std::strcmp("/jacklink/rolling", m.AddressPattern()) == 0) {
@@ -1913,10 +1897,6 @@ void JackTransportLink::rebuildAudioPorts(size_t newIn, size_t newOut) {
   mNumStereoInChannels  = newIn;
   mNumStereoOutChannels = newOut;
 
-  jack_nframes_t bufSize = jack_get_buffer_size(mJackClient);
-  mStereoSendBuf.resize(newIn  * 2 * bufSize);
-  mStereoRecvBuf.resize(newOut * 2 * bufSize);
-
   jack_activate(mJackClient);
 
   // Restore saved connections
@@ -1954,7 +1934,10 @@ void JackTransportLink::rebuildAudioPorts(size_t newIn, size_t newOut) {
 }
 
 void JackTransportLink::applySourceFiltersFromConfig(const std::string& jsonText) {
-  if (parseLinkAudioSourceFilters(jsonText, mLinkAudioPeerFilters, mLinkAudioChannelFilters)) {
+  std::lock_guard<std::recursive_mutex> controlLock(mControlMutex);
+  std::lock_guard<std::mutex> filterLock(mSourceFilterMutex);
+  if (parseLinkAudioSourceFilters(jsonText, mLinkAudioPeerFilters,
+                                  mLinkAudioChannelFilters)) {
     mNeedsSourceUpdate.store(true, std::memory_order_release);
     // republish the configured-filter reflection: the constructor already published an
     // (empty) source-filters before config was loaded, so without this the runner/web
@@ -1964,6 +1947,7 @@ void JackTransportLink::applySourceFiltersFromConfig(const std::string& jsonText
 }
 
 void JackTransportLink::saveConfig() {
+  std::lock_guard<std::recursive_mutex> controlLock(mControlMutex);
   if (mConfigPath.empty()) return;
   namespace fs = std::filesystem;
   std::error_code ec;
@@ -1975,16 +1959,21 @@ void JackTransportLink::saveConfig() {
   cfg["time_sig_denom"]    = mInitialTimeSigDenom;
   cfg["ticks_per_beat"]    = mInitialTicksPerBeat;
   cfg["start_stop_sync"]   = mLink.isStartStopSyncEnabled();
-  cfg["sync"]              = mSyncLink;
+  cfg["sync"] = mSyncLink.load(std::memory_order_acquire);
   cfg["link_audio_enabled"]    = mLinkAudioEnabled;
   cfg["in_stereo_channels"]    = mNumStereoInChannels;
   cfg["out_stereo_channels"]   = mNumStereoOutChannels;
   nlohmann::json filters = nlohmann::json::array();
-  for (size_t i = 0; i < mLinkAudioPeerFilters.size(); ++i) {
-    nlohmann::json entry = nlohmann::json::object();
-    if (!mLinkAudioPeerFilters[i].empty())    entry["peer"]    = mLinkAudioPeerFilters[i];
-    if (!mLinkAudioChannelFilters[i].empty()) entry["channel"] = mLinkAudioChannelFilters[i];
-    filters.push_back(entry);
+  {
+    std::lock_guard<std::mutex> filterLock(mSourceFilterMutex);
+    for (size_t i = 0; i < mLinkAudioPeerFilters.size(); ++i) {
+      nlohmann::json entry = nlohmann::json::object();
+      if (!mLinkAudioPeerFilters[i].empty())
+        entry["peer"] = mLinkAudioPeerFilters[i];
+      if (!mLinkAudioChannelFilters[i].empty())
+        entry["channel"] = mLinkAudioChannelFilters[i];
+      filters.push_back(entry);
+    }
   }
   cfg["source_filters"] = filters;
   cfg["sink_names"]     = mSinkNames;

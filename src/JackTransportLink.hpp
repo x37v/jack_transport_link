@@ -20,6 +20,13 @@
 #include <osc/OscPacketListener.h>
 #include <osc/OscReceivedElements.h>
 
+// Every atomic type touched by a JACK realtime callback must be implemented
+// without a library fallback lock on each supported target.
+static_assert(std::atomic<bool>::is_always_lock_free);
+static_assert(std::atomic<float>::is_always_lock_free);
+static_assert(std::atomic<jack_nframes_t>::is_always_lock_free);
+static_assert(std::atomic<size_t>::is_always_lock_free);
+
 class JackTransportLink : public oscpack::OscPacketListener {
 public:
   using SinkRenderer = ableton::linkaudio::LinkAudioSinkRenderer<ableton::LinkAudio>;
@@ -59,7 +66,6 @@ public:
                           void *arg);
   static void propertyChangeCallback(jack_uuid_t subject, const char *key,
                                      jack_property_change_t change, void *arg);
-  static int bufferSizeCallback(jack_nframes_t nframes, void *arg);
   static void latencyCallback(jack_latency_callback_mode_t mode, void *arg);
 
 protected:
@@ -73,7 +79,6 @@ private:
   int syncCallback(jack_transport_state_t state, jack_position_t *pos);
   void propertyChangeCallback(jack_uuid_t subject, const char *key,
                               jack_property_change_t change);
-  int bufferSizeCallback(jack_nframes_t nframes);
   // Re-read JACK's measured capture/playback latency from our in_N/out_N ports, then recompute
   // effective values. Called from processEvents (main thread) — NOT from the latency callback —
   // so the port-vector reads are serialized with rebuildAudioPorts() on the same thread.
@@ -121,6 +126,10 @@ private:
   double mSampleRate;
   size_t mNumStereoInChannels;
   size_t mNumStereoOutChannels;
+  // Serializes non-real-time control operations arriving from the main loop,
+  // JACK metadata callback, and OSC thread. Recursive because these operations
+  // call helpers that also take a snapshot under the same lock.
+  mutable std::recursive_mutex mControlMutex;
   // Link peer-name override (empty = auto/hostname). Declared before mLink because the
   // constructor seeds mLink's peer name from effectiveLinkPeerName(), which reads it.
   std::string mLinkPeerName;
@@ -136,7 +145,7 @@ private:
 
   jack_port_t *mClickPort = nullptr;
   double mInternalBeat = 0.0;
-  bool mSyncLink;
+  std::atomic<bool> mSyncLink;
   bool mWasSyncLink;
 
   int32_t mBeatLast = -1;
@@ -149,8 +158,8 @@ private:
   jack_transport_state_t mTransportStateReportedLast =
       jack_transport_state_t::JackTransportStopped;
 
-  std::atomic<double> mBPM;
-  double mLinkBPM;
+  std::atomic<float> mBPM;
+  std::atomic<double> mLinkBPM;
   double mBPMLast;
   double mQuantum;
   double mInitialQuantum; // time sig num, called quantum in link
@@ -159,14 +168,9 @@ private:
 
   jack_uuid_t mJackClientUUID;
 
-  bool mReportBPM = false;
-  bool mReportLinkSync = false;
-  bool mReportStartStopEnable = false;
-
-  // mStereoSendBuf: mNumStereoInChannels * 2 * nframes
-  // mStereoRecvBuf: mNumStereoOutChannels * 2 * nframes
-  std::vector<double> mStereoSendBuf;
-  std::vector<double> mStereoRecvBuf;
+  std::atomic<bool> mReportBPM{false};
+  std::atomic<bool> mReportLinkSync{false};
+  std::atomic<bool> mReportStartStopEnable{false};
 
   std::vector<jack_port_t*> mAudioIns;  // 2 * mNumStereoInChannels ports
   std::vector<jack_port_t*> mAudioOuts; // 2 * mNumStereoOutChannels ports
@@ -185,7 +189,7 @@ private:
   std::atomic<double> mPlaybackLatencyTrimMs{0.0};
   // Receiver playout buffer in milliseconds (converted to beats at the current tempo in the
   // renderer). Configurable; default 100ms, clamped to [0, 2000].
-  std::atomic<double> mLatencyMs{100.0};
+  std::atomic<float> mLatencyMs{100.0f};
   // "Sync to Incoming Audio" (formerly Ableton's "Monitoring Mode"): when true, delay the local
   // transport timeline (the reported JACK BBT) by the receive buffer so transport-locked local
   // generators align with the incoming audio; when false, the transport runs live. The receive
@@ -226,12 +230,12 @@ private:
   std::atomic<bool> mNeedsSourceUpdate{false};
   std::atomic<int> mRequestedStereoInChannels{-1};
   std::atomic<int> mRequestedStereoOutChannels{-1};
-  bool mReportLinkAudioChannels = false;
-  bool mReportLinkAudioSource = false;
-  bool mReportLinkAudioSourceFilters = false;
+  std::atomic<bool> mReportLinkAudioChannels{false};
+  std::atomic<bool> mReportLinkAudioSource{false};
+  std::atomic<bool> mReportLinkAudioSourceFilters{false};
 
   std::string mConfigPath;
-  bool mNeedsSaveConfig = false;
+  std::atomic<bool> mNeedsSaveConfig{false};
   std::chrono::steady_clock::time_point mLastConfigSave{};
   // Throttle for periodic source-health metadata publishing (see processEvents).
   std::chrono::steady_clock::time_point mLastHealthPublish{};
