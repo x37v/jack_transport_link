@@ -171,15 +171,13 @@ public:
       if (!headEnd) {
         // beginBeats/endBeats return nullopt when the buffer was stamped in a
         // *different Link session*, so its beat time cannot be placed on our
-        // timeline at all. Dropping it is the only option, but it must be
-        // counted: this is otherwise indistinguishable from "nothing is
-        // arriving", and no latency value can fix it.
+        // timeline at all; dropping it is the only option.
         //
-        // Comparing the optional directly (as this used to) silently swallowed
-        // the case — `std::optional` mixed comparison defines `nullopt < v` as
-        // *true* for every v, so such a buffer always looked "too old" and was
-        // discarded no matter how large the playout buffer was.
-        mUnmappableCount.fetch_add(1, std::memory_order_relaxed);
+        // Test this explicitly. Comparing the optional straight against the
+        // target (as this used to) silently swallowed the case: `std::optional`
+        // mixed comparison defines `nullopt < v` as *true* for every v, so such
+        // a buffer always looked "too old" and was discarded no matter how
+        // large the playout buffer was.
         mpQueueReader->releaseSlot();
         continue;
       }
@@ -208,7 +206,6 @@ public:
       const auto startBufferEnd = info.endBeats(sessionState, quantum);
 
       if (!startBufferBegin || !startBufferEnd) {
-        mUnmappableCount.fetch_add(1, std::memory_order_relaxed);
         silenceOutputs();
         mBuffered = 0;
         return;
@@ -250,7 +247,6 @@ public:
       // is established the release loop above no longer runs, so an unmappable buffer
       // reaches this point intact.)
       if (!bufferBegin || !bufferEnd) {
-        mUnmappableCount.fetch_add(1, std::memory_order_relaxed);
         break;
       }
 
@@ -392,7 +388,6 @@ public:
       mHasLastArrival = false;
       mJitterMs.store(0.0f, std::memory_order_relaxed);
       mDropoutCount.store(0, std::memory_order_relaxed);
-      mUnmappableCount.store(0, std::memory_order_relaxed);
       mArrivalOffsetMs.store(0.0f, std::memory_order_relaxed);
       mBuffered.store(0.0f, std::memory_order_relaxed);
       mRendering.store(false, std::memory_order_relaxed);
@@ -408,12 +403,6 @@ public:
   uint32_t dropoutCount() const {
     return mDropoutCount.load(std::memory_order_relaxed);
   }
-  // Buffers that arrived but were stamped in a *different Link session*, so their beat time
-  // can't be mapped onto ours. Nonzero means audio is reaching us and being thrown away —
-  // a state no latency setting can fix, and one that otherwise looks exactly like silence.
-  uint32_t unmappableCount() const {
-    return mUnmappableCount.load(std::memory_order_relaxed);
-  }
   // Measured delay between the live beat and the beat the newest arrived buffer begins at.
   // The playout buffer (latencyMs) has to exceed this for anything to play, so it is the
   // number to compare a "why do I need so much latency?" against.
@@ -425,7 +414,6 @@ public:
   // receive path increments, so it's safe to call from a control thread while audio runs.
   void resetDropoutCount() {
     mDropoutCount.store(0, std::memory_order_relaxed);
-    mUnmappableCount.store(0, std::memory_order_relaxed);
   }
   float jitterMs() const { return mJitterMs.load(std::memory_order_relaxed); }
 
@@ -472,7 +460,6 @@ private:
   std::atomic<float> mBuffered = 0;
   // Written only by the render (RT) thread, read by the control thread.
   std::atomic<bool> mRendering{false};
-  std::atomic<uint32_t> mUnmappableCount{0};
   std::atomic<float> mArrivalOffsetMs{0.0f};
 
   // Health metrics: dropouts (starvation underruns) counted in receive() on the
@@ -516,7 +503,6 @@ public:
   float buffered() const { return 0.0f; }
   bool receiving() const { return false; }
   uint32_t dropoutCount() const { return 0; }
-  uint32_t unmappableCount() const { return 0; }
   float arrivalOffsetMs() const { return 0.0f; }
   void resetDropoutCount() {}
   float jitterMs() const { return 0.0f; }

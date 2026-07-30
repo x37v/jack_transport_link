@@ -160,7 +160,7 @@ previous name — removal is only ever expressed by omitting an entry.
 | Key | Type | Access | Description |
 |-----|------|--------|-------------|
 | `linkaudio/channels` | JSON | R | Available channels grouped by peer: `[{"peer":…,"channels":[…]}, …]`. |
-| `linkaudio/source-status` | JSON | R | Per-source live receive telemetry, key-tagged and in display order: `[{"key":…,"connected":…,"receiving":…,"buffered_ms":…,"dropouts":…,"unmappable":…,"arrival_offset_ms":…,"jitter_ms":…}, …]`. Updated a few times per second, and immediately on a connect/disconnect. The configured identity is in `linkaudio/sources`; because it is matched exactly, the resolved channel is either identical to it or absent, which is what `connected` reports. `receiving` is true while blocks are actually being filled with audio — see [Reading the telemetry](#reading-the-telemetry). |
+| `linkaudio/source-status` | JSON | R | Per-source live receive telemetry, key-tagged and in display order: `[{"key":…,"connected":…,"receiving":…,"buffered_ms":…,"dropouts":…,"arrival_offset_ms":…,"jitter_ms":…}, …]`. Updated a few times per second, and immediately on a connect/disconnect. The configured identity is in `linkaudio/sources`; because it is matched exactly, the resolved channel is either identical to it or absent, which is what `connected` reports. `receiving` is true while blocks are actually being filled with audio — see [Reading the telemetry](#reading-the-telemetry). |
 
 ### Link Audio — latency (read-only)
 
@@ -285,19 +285,16 @@ A peer appearing that no source names connects to nothing.
 | | meaning |
 |---|---|
 | `connected: false` | nothing on the network is advertising this exact peer + channel |
-| `connected: true, receiving: false`, `unmappable: 0` | subscribed, but nothing usable is arriving |
-| `connected: true, receiving: false`, `unmappable` rising | audio **is** arriving, but stamped for a different Link session, so it can't be beat-aligned and is discarded |
+| `connected: true, receiving: false` | subscribed, but rendering **pure silence** |
 | `connected: true, receiving: true` | audio is flowing |
 
-`unmappable` counts buffers whose `beginBeats`/`endBeats` map to nothing, which Link reports when
-the buffer came from a *different Link session*. No `latency` value can fix that — the two devices
-have to be in the same session (Link enabled on both, same network). Beware when reading this code:
-`endBeats()` returns `std::optional<double>`, and comparing it directly against a `double` is a
-trap, because `nullopt < v` is defined as **true** for every `v` — so a foreign-session buffer
-looks "too old" and is silently discarded at any buffer size.
-
-A `receiving: false` with `unmappable: 0` is almost always a playout buffer too small for the
-network. A sender stamps each
+The middle row is almost always a playout buffer too small to cover the arrival offset — see
+[How much `latency` a source needs](#how-much-latency-a-source-needs). The other possibility is
+that the sender is in a *different Link session*: `beginBeats`/`endBeats` then map to nothing and
+the buffer has to be discarded, which looks the same from the outside. Beware when reading that
+code — `endBeats()` returns `std::optional<double>`, and comparing it directly against a `double`
+is a trap, because `nullopt < v` is defined as **true** for every `v`, so a foreign-session buffer
+looks "too old" and gets discarded at any buffer size. A sender stamps each
 buffer with the beat it captured and then transmits it, so a buffer inevitably *arrives* after the
 beat it carries. `linkaudio/latency` is what lets the receiver aim its playout cursor far enough
 behind the live beat for the audio to have shown up. Set it to `0` and the cursor sits on the live
