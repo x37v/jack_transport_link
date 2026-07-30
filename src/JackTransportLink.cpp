@@ -45,23 +45,6 @@ const std::string
 // sync, no Link Audio); jtl still runs as the local JACK transport master.
 const std::string
     link_enabled_key("http://www.x37v.info/jack/metadata/link/enabled");
-// The explicit, ordered source/sink lists. Both are R/W: a client writes the desired list,
-// and we publish the canonical (key-tagged, display-ordered) applied value back.
-const std::string
-    linkaudio_sinks_key("http://www.x37v.info/jack/metadata/linkaudio/sinks");
-const std::string
-    linkaudio_sources_key("http://www.x37v.info/jack/metadata/linkaudio/sources");
-// Per-source live receive telemetry (connected, buffered ms, dropout count, jitter ms),
-// key-tagged and in display order, published periodically so a client can show receive
-// quality. Kept out of the writable `sources` list so ~4 Hz telemetry doesn't churn a
-// property that is also a write target.
-const std::string
-    linkaudio_source_status_key("http://www.x37v.info/jack/metadata/linkaudio/source-status");
-// Write-only command: zero a source's cumulative dropout count (value = slot key, or "*" for
-// every source), so the count reads as "dropouts since I last changed a setting". We remove the
-// property once we've acted on it, which is also what lets the same value be sent twice.
-const std::string
-    linkaudio_reset_dropouts_key("http://www.x37v.info/jack/metadata/linkaudio/reset-dropouts");
 const char *string_type = "text/plain";
 // JACK's standard port presentation metadata (grouping + display name), set on our own
 // audio ports so patchbays (e.g. the RNBO runner's graph editor) group and label them.
@@ -71,30 +54,6 @@ const std::string order_key(JACK_METADATA_ORDER);
 const char *link_audio_port_group = "jack-link-audio";
 // JACK recommends this type for the order key; it also matches what the RNBO runner parses.
 const char *order_type = "http://www.w3.org/2001/XMLSchema#int";
-const std::string
-    linkaudio_channels_key("http://www.x37v.info/jack/metadata/linkaudio/channels");
-// The local Link peer name broadcast to the session, decoupled from the JACK client name.
-const std::string
-    linkaudio_peer_name_key("http://www.x37v.info/jack/metadata/linkaudio/peer-name");
-// Writable receiver playout buffer, in milliseconds (converted to beats at the current tempo).
-const std::string
-    linkaudio_latency_key("http://www.x37v.info/jack/metadata/linkaudio/latency");
-// Writable "Sync to Incoming Audio" toggle: whether to delay the local transport timeline to
-// match the (always-applied) receive buffer, so transport-locked local generators align with
-// incoming audio. It does NOT gate the receive buffer itself.
-const std::string
-    linkaudio_sync_key("http://www.x37v.info/jack/metadata/linkaudio/sync-to-incoming");
-// Read-only (GET) effective I/O latency actually applied to the beat mapping, in milliseconds,
-// plus the auto-detected-only value (effective = auto + user trim). Published so a client can
-// display what compensation is in effect.
-const std::string
-    linkaudio_capture_latency_key("http://www.x37v.info/jack/metadata/linkaudio/capture-latency");
-const std::string
-    linkaudio_playback_latency_key("http://www.x37v.info/jack/metadata/linkaudio/playback-latency");
-const std::string
-    linkaudio_capture_latency_auto_key("http://www.x37v.info/jack/metadata/linkaudio/capture-latency-auto");
-const std::string
-    linkaudio_playback_latency_auto_key("http://www.x37v.info/jack/metadata/linkaudio/playback-latency-auto");
 const std::array<std::string, 2> true_values = {"true", "1"};
 
 // The Link Audio state push, sent to every registered listener. Deliberately a different namespace
@@ -231,48 +190,6 @@ std::string sourceSlotKey(const std::string& peer, const std::string& channel) {
   return slotKey(identity);
 }
 
-// Parse a desired-sink list: [{"key":…,"name":…}, …]. `key` is optional (an entry with only a
-// name is self-keying). Returns false on a parse error / non-array value.
-bool parseDesiredSinks(const std::string& s,
-                       std::vector<JackTransportLink::DesiredSink>& out) {
-  try {
-    auto j = nlohmann::json::parse(s);
-    if (!j.is_array()) return false;
-    out.clear();
-    for (const auto& e : j) {
-      if (!e.is_object()) continue;
-      JackTransportLink::DesiredSink d;
-      d.key  = e.value("key",  std::string());
-      d.name = e.value("name", std::string());
-      out.push_back(std::move(d));
-    }
-    return true;
-  } catch (...) {
-    return false;
-  }
-}
-
-// Parse a desired-source list: [{"key":…,"peer":…,"channel":…}, …].
-bool parseDesiredSources(const std::string& s,
-                         std::vector<JackTransportLink::DesiredSource>& out) {
-  try {
-    auto j = nlohmann::json::parse(s);
-    if (!j.is_array()) return false;
-    out.clear();
-    for (const auto& e : j) {
-      if (!e.is_object()) continue;
-      JackTransportLink::DesiredSource d;
-      d.key     = e.value("key",     std::string());
-      d.peer    = e.value("peer",    std::string());
-      d.channel = e.value("channel", std::string());
-      out.push_back(std::move(d));
-    }
-    return true;
-  } catch (...) {
-    return false;
-  }
-}
-
 } // namespace
 
 JackTransportLink::JackTransportLink(jack_client_t *client,
@@ -362,9 +279,9 @@ JackTransportLink::JackTransportLink(jack_client_t *client,
       setNumPeersProperty(mLink.numPeers());
       // publish the effective Link peer name (always non-empty: override or hostname)
       mAppliedLinkPeerName = effectiveLinkPeerName();
-      setLinkAudioPeerNameProperty();
-      setLinkAudioLatencyMsProperty();
-      setLinkAudioSyncToIncomingProperty();
+      sendLinkAudioPeerName();
+      sendLinkAudioLatencyMs();
+      sendLinkAudioSyncToIncoming();
       jack_set_property_change_callback(
           mJackClient, JackTransportLink::propertyChangeCallback, this);
     } else {
@@ -407,9 +324,6 @@ JackTransportLink::JackTransportLink(jack_client_t *client,
     for (auto& s : sources)
       desiredSources.push_back({std::string(), std::move(s.first), std::move(s.second)});
     reconcileSources(desiredSources);
-  }
-  if (mLinkAudioEnabled && !jack_uuid_empty(mJackClientUUID)) {
-    setLinkAudioChannelsProperty({});
   }
   mUpdatePortMeta = false;
   updateAudioPortMetadata();
@@ -493,30 +407,9 @@ void JackTransportLink::recomputeEffectiveLatency() {
       effFrames(mAutoPlaybackLatencyFrames.load(std::memory_order_acquire),
                 mPlaybackLatencyTrimMs.load(std::memory_order_acquire)),
       std::memory_order_release);
-  // All callers (constructor + processEvents) are on the main thread, so publishing the read-only
-  // metadata directly here is safe (jack_set_property must not run on the notification thread).
-  setLinkAudioLatencyProperties();
-}
-
-void JackTransportLink::setLinkAudioLatencyProperties() {
+  // All callers (constructor + processEvents) are on the main thread, which is where sends have to
+  // happen (see flushOsc).
   sendLinkAudioLatencies();
-  if (jack_uuid_empty(mJackClientUUID)) return;
-  const double sr = mSampleRate > 0.0 ? mSampleRate : 48000.0;
-  auto ms = [sr](jack_nframes_t frames) {
-    return std::to_string(1000.0 * static_cast<double>(frames) / sr);
-  };
-  jack_set_property(mJackClient, mJackClientUUID, linkaudio_capture_latency_key.c_str(),
-                    ms(mEffCaptureLatencyFrames.load(std::memory_order_acquire)).c_str(),
-                    decimal_type);
-  jack_set_property(mJackClient, mJackClientUUID, linkaudio_playback_latency_key.c_str(),
-                    ms(mEffPlaybackLatencyFrames.load(std::memory_order_acquire)).c_str(),
-                    decimal_type);
-  jack_set_property(mJackClient, mJackClientUUID, linkaudio_capture_latency_auto_key.c_str(),
-                    ms(mAutoCaptureLatencyFrames.load(std::memory_order_acquire)).c_str(),
-                    decimal_type);
-  jack_set_property(mJackClient, mJackClientUUID, linkaudio_playback_latency_auto_key.c_str(),
-                    ms(mAutoPlaybackLatencyFrames.load(std::memory_order_acquire)).c_str(),
-                    decimal_type);
 }
 
 void JackTransportLink::queueOsc(std::string packet) {
@@ -572,8 +465,6 @@ void JackTransportLink::processEventsLocked() {
     }
     if (mNeedsResetDropouts.exchange(false, std::memory_order_acq_rel)) {
       resetSourceDropouts(mResetDropoutsTarget);
-      // one-shot command: clear it so the same value can be sent again
-      removePropertyIfExists(linkaudio_reset_dropouts_key);
     }
     if (mChannelsChanged.exchange(false, std::memory_order_acq_rel)) {
       if (updateLinkAudioSource()) { mReportLinkAudioSource = true; mUpdatePortMeta = true; }
@@ -583,13 +474,13 @@ void JackTransportLink::processEventsLocked() {
       if (updateLinkAudioSource()) { mReportLinkAudioSource = true; mUpdatePortMeta = true; }
     }
     if (mReportLinkAudioChannels.exchange(false, std::memory_order_acq_rel)) {
-      setLinkAudioChannelsProperty(mLink.channels());
+      sendLinkAudioChannels(mLink.channels());
     }
     if (mReportLinkAudioSource.exchange(false, std::memory_order_acq_rel)) {
       // A connect/disconnect should show up at once rather than waiting out the telemetry
       // timer, so publish now and restart the throttle.
       mLastHealthPublish = std::chrono::steady_clock::now();
-      setLinkAudioSourceStatusProperty();
+      sendLinkAudioSourceStatus();
     }
     if (mUpdatePortMeta) {
       mUpdatePortMeta = false;
@@ -601,7 +492,7 @@ void JackTransportLink::processEventsLocked() {
       auto now = std::chrono::steady_clock::now();
       if (now - mLastHealthPublish >= std::chrono::milliseconds(250)) {
         mLastHealthPublish = now;
-        setLinkAudioSourceStatusProperty();
+        sendLinkAudioSourceStatus();
       }
     }
   }
@@ -613,10 +504,10 @@ void JackTransportLink::processEventsLocked() {
     updateLatencyRanges();
   }
   if (mNeedsPublishLatencyMs.exchange(false, std::memory_order_acq_rel)) {
-    setLinkAudioLatencyMsProperty();
+    sendLinkAudioLatencyMs();
   }
   if (mNeedsPublishSyncToIncoming.exchange(false, std::memory_order_acq_rel)) {
-    setLinkAudioSyncToIncomingProperty();
+    sendLinkAudioSyncToIncoming();
   }
   if (mNeedsApplyLinkEnabled.exchange(false, std::memory_order_acq_rel)) {
     // mLink.enable() is not RT-safe; applying here on the main thread is correct.
@@ -1105,13 +996,7 @@ void JackTransportLink::propertyChangeCallback(jack_uuid_t subject,
     bool isbpm = !key || bpm_key.compare(key) == 0;
     bool islinksync = !key || linksync_key.compare(key) == 0;
     bool isenable = !key || start_stop_key.compare(key) == 0;
-    bool ispeername    = !key || linkaudio_peer_name_key.compare(key) == 0;
-    bool islatency     = !key || linkaudio_latency_key.compare(key) == 0;
-    bool issync        = !key || linkaudio_sync_key.compare(key) == 0;
     bool islinkenabled = !key || link_enabled_key.compare(key) == 0;
-    bool issinks       = !key || linkaudio_sinks_key.compare(key) == 0;
-    bool issources     = !key || linkaudio_sources_key.compare(key) == 0;
-    bool isresetdrops  = key && linkaudio_reset_dropouts_key.compare(key) == 0;
     // Treat a newly-created property the same as a changed one. Properties that
     // jack_transport_link doesn't publish itself arrive as PropertyCreated, not
     // PropertyChanged.
@@ -1159,82 +1044,6 @@ void JackTransportLink::propertyChangeCallback(jack_uuid_t subject,
         if (values != std::string(set ? "true" : "false")) {
           mNeedsPublishLinkEnabled.store(true, std::memory_order_release);
         }
-      } else if (ispeername &&
-                 get_property(mJackClientUUID, linkaudio_peer_name_key, values, types)) {
-        // The published value is the *effective* name (override or hostname), so a
-        // client can display what's broadcast. Only treat a write as a new override
-        // when it differs from the current effective name — that filters out our own
-        // republished value (and a redundant write of the current hostname), which
-        // would otherwise latch the hostname in as an override and break auto mode.
-        if (values != effectiveLinkPeerName()) {
-          mLinkPeerName = values;
-          mNeedsApplyPeerName.store(true, std::memory_order_release);
-          mNeedsSaveConfig = true;
-        }
-      } else if (islatency &&
-                 get_property(mJackClientUUID, linkaudio_latency_key, values, types)) {
-        double clamped;
-        try {
-          clamped = clampLatencyMs(std::stod(values));
-        } catch (...) {
-          // unparseable write -> keep the current value, but correct the metadata below
-          clamped = mLatencyMs.load(std::memory_order_acquire);
-        }
-        if (clamped != mLatencyMs.load(std::memory_order_acquire)) {
-          mLatencyMs.store(clamped, std::memory_order_release);
-          mNeedsSaveConfig = true;
-        }
-        // Republish unless the metadata already holds our canonical form. This both filters our
-        // own echo (values == canonical -> skip, no loop) and corrects any out-of-range / NaN /
-        // unparseable / differently-formatted client write back to the applied value, so the
-        // read-back stays consistent even when the sanitized value equals the current one.
-        if (values != std::to_string(clamped)) {
-          mNeedsPublishLatencyMs.store(true, std::memory_order_release);
-        }
-      } else if (issync &&
-                 get_property(mJackClientUUID, linkaudio_sync_key, values, types)) {
-        const bool set = std::find(true_values.begin(), true_values.end(), values) !=
-                         true_values.end();
-        if (set != mSyncToIncomingAudio.load(std::memory_order_acquire)) {
-          mSyncToIncomingAudio.store(set, std::memory_order_release);
-          mNeedsSaveConfig = true;
-        }
-        // Republish our canonical form unless the metadata already matches it (filters our own
-        // echo; corrects any non-canonical write, e.g. "1"/"0", back to "true"/"false").
-        if (values != std::string(set ? "true" : "false")) {
-          mNeedsPublishSyncToIncoming.store(true, std::memory_order_release);
-        }
-      } else if (mLinkAudioEnabled && issinks &&
-                 get_property(mJackClientUUID, linkaudio_sinks_key, values, types)) {
-        // Skip our own echo of the canonical value; anything else is a client's desired list.
-        // Unparseable JSON still triggers a reconcile of the unchanged list, whose republish
-        // corrects the property back to the canonical value.
-        if (values != mPublishedSinksJson) {
-          std::vector<DesiredSink> desired;
-          if (parseDesiredSinks(values, desired)) {
-            mDesiredSinks = std::move(desired);
-          } else {
-            std::cerr << "warning: unparseable linkaudio/sinks write, ignoring\n";
-            pendingSinks(); // reconcile the unchanged list so the republish corrects it
-          }
-          mNeedsReconcileSinks.store(true, std::memory_order_release);
-        }
-      } else if (mLinkAudioEnabled && isresetdrops &&
-                 get_property(mJackClientUUID, linkaudio_reset_dropouts_key, values, types)) {
-        mResetDropoutsTarget = values;
-        mNeedsResetDropouts.store(true, std::memory_order_release);
-      } else if (mLinkAudioEnabled && issources &&
-                 get_property(mJackClientUUID, linkaudio_sources_key, values, types)) {
-        if (values != mPublishedSourcesJson) {
-          std::vector<DesiredSource> desired;
-          if (parseDesiredSources(values, desired)) {
-            mDesiredSources = std::move(desired);
-          } else {
-            std::cerr << "warning: unparseable linkaudio/sources write, ignoring\n";
-            pendingSources();
-          }
-          mNeedsReconcileSources.store(true, std::memory_order_release);
-        }
       }
     } else if (change == jack_property_change_t::PropertyDeleted) {
       if (isbpm)
@@ -1249,34 +1058,6 @@ void JackTransportLink::propertyChangeCallback(jack_uuid_t subject,
         mNeedsApplyLinkEnabled.store(true, std::memory_order_release);
         mNeedsPublishLinkEnabled.store(true, std::memory_order_release);
         mNeedsSaveConfig = true;
-      }
-      if (ispeername) {
-        // clearing the property reverts to auto (hostname); republish the effective name
-        mLinkPeerName.clear();
-        mNeedsApplyPeerName.store(true, std::memory_order_release);
-        mNeedsSaveConfig = true;
-      }
-      if (islatency) {
-        // clearing reverts to the default; republish so clients reflect it
-        mLatencyMs.store(100.0, std::memory_order_release);
-        mNeedsPublishLatencyMs.store(true, std::memory_order_release);
-        mNeedsSaveConfig = true;
-      }
-      if (issync) {
-        // clearing reverts to the default (off); republish so clients reflect it
-        mSyncToIncomingAudio.store(false, std::memory_order_release);
-        mNeedsPublishSyncToIncoming.store(true, std::memory_order_release);
-        mNeedsSaveConfig = true;
-      }
-      // Deleting a list property reverts it to its default: the empty list (all slots removed),
-      // matching how the other writable keys revert on delete.
-      if (mLinkAudioEnabled && issinks) {
-        mDesiredSinks.clear();
-        mNeedsReconcileSinks.store(true, std::memory_order_release);
-      }
-      if (mLinkAudioEnabled && issources) {
-        mDesiredSources.clear();
-        mNeedsReconcileSources.store(true, std::memory_order_release);
       }
     }
   }
@@ -1347,15 +1128,6 @@ std::string JackTransportLink::buildChannelsJson(
   return peers.dump();
 }
 
-void JackTransportLink::setLinkAudioChannelsProperty(
-    const std::vector<ableton::LinkAudio::Channel>& channels) {
-  sendLinkAudioChannels(channels);
-  if (jack_uuid_empty(mJackClientUUID)) return;
-  const auto value = buildChannelsJson(channels);
-  jack_set_property(mJackClient, mJackClientUUID, linkaudio_channels_key.c_str(),
-                    value.c_str(), "application/json");
-}
-
 // The canonical sink list: key-tagged, in display order. Authority for both the slot set and the
 // display order, which is why it stays one atomic JSON blob rather than per-slot values.
 std::string JackTransportLink::buildSinksJson() const {
@@ -1381,38 +1153,9 @@ std::string JackTransportLink::buildSourcesJson() const {
   return arr.dump();
 }
 
-// Publish the canonical sink list — key-tagged, in display order. Only writes when the metadata
-// doesn't already hold this value: that filters our own echo (no notification loop) and, when a
-// client's write was partly rejected, corrects the property back to the applied value so the
-// client's read-back self-corrects. Mirrors the sanitize-then-republish-if-different pattern
-// used for linkaudio/latency.
-void JackTransportLink::setLinkAudioSinksProperty() {
-  sendLinkAudioSinks();
-  if (jack_uuid_empty(mJackClientUUID)) return;
-  mPublishedSinksJson = buildSinksJson();
-  std::string cur, type;
-  if (!(get_property(mJackClientUUID, linkaudio_sinks_key, cur, type) &&
-        cur == mPublishedSinksJson))
-    jack_set_property(mJackClient, mJackClientUUID, linkaudio_sinks_key.c_str(),
-                      mPublishedSinksJson.c_str(), "application/json");
-}
-
-// Publish the canonical source list — key-tagged identities, in display order. See
-// setLinkAudioSinksProperty for the write-only-on-difference rationale.
-void JackTransportLink::setLinkAudioSourcesProperty() {
-  sendLinkAudioSources();
-  if (jack_uuid_empty(mJackClientUUID)) return;
-  mPublishedSourcesJson = buildSourcesJson();
-  std::string cur, type;
-  if (!(get_property(mJackClientUUID, linkaudio_sources_key, cur, type) &&
-        cur == mPublishedSourcesJson))
-    jack_set_property(mJackClient, mJackClientUUID, linkaudio_sources_key.c_str(),
-                      mPublishedSourcesJson.c_str(), "application/json");
-}
-
 // Per-source live receive telemetry, key-tagged and in display order. buffered() is in seconds
-// (from the renderer); dropouts and jitter come from the renderer's atomics. Published on a
-// timer from processEvents, and immediately on a connect/disconnect.
+// (from the renderer); dropouts and jitter come from the renderer's atomics. Sent on a timer from
+// processEvents, and immediately on a connect/disconnect.
 std::string JackTransportLink::buildSourceStatusJson() const {
   // The three measured floats are quantized to 0.1 ms so that float wobble in an otherwise
   // unchanged reading doesn't defeat the change guard — which is what collapses the 4 Hz stream to
@@ -1440,13 +1183,6 @@ std::string JackTransportLink::buildSourceStatusJson() const {
     });
   }
   return arr.dump();
-}
-
-void JackTransportLink::setLinkAudioSourceStatusProperty() {
-  sendLinkAudioSourceStatus();
-  if (jack_uuid_empty(mJackClientUUID)) return;
-  jack_set_property(mJackClient, mJackClientUUID, linkaudio_source_status_key.c_str(),
-                    buildSourceStatusJson().c_str(), "application/json");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1583,9 +1319,13 @@ void JackTransportLink::sendOscSnapshot(const oscpack::IpEndpointName& endpoint)
                              ms(mAutoPlaybackLatencyFrames.load(std::memory_order_acquire))));
 }
 
-// Force the low-rate state back out to every listener. Dropping the caches and re-running the
-// normal senders keeps this from being a second, divergent copy of the send logic.
-// source-status is left out on purpose: its own 4 Hz timer already re-offers it.
+// Force the state back out to every listener. Dropping the caches and re-running the normal senders
+// keeps this from being a second, divergent copy of the send logic.
+//
+// source-status is included even though it has its own 4 Hz timer, because the change guard is
+// exactly what makes it need this: with every source disconnected the payload is a constant
+// all-zero array, so the timer stops sending and a single lost datagram would otherwise leave a
+// listener showing the last values it happened to see, forever.
 void JackTransportLink::republishOscState() {
   mSentAvailable.reset();
   mSentChannelsJson.reset();
@@ -1594,6 +1334,7 @@ void JackTransportLink::republishOscState() {
   mSentSyncToIncoming.reset();
   mSentSinksJson.reset();
   mSentSourcesJson.reset();
+  mSentSourceStatusJson.reset();
   mSentCaptureLatencyMs.reset();
   mSentPlaybackLatencyMs.reset();
   mSentCaptureLatencyAutoMs.reset();
@@ -1606,6 +1347,7 @@ void JackTransportLink::republishOscState() {
   sendLinkAudioSyncToIncoming();
   sendLinkAudioSinks();
   sendLinkAudioSources();
+  sendLinkAudioSourceStatus();
   sendLinkAudioLatencies();
 }
 
@@ -1672,50 +1414,15 @@ std::string JackTransportLink::effectiveLinkPeerName() const {
   return "jack-transport-link";
 }
 
-// Publish the effective peer name so a client can display what's actually broadcast.
-void JackTransportLink::setLinkAudioPeerNameProperty() {
-  sendLinkAudioPeerName();
-  if (jack_uuid_empty(mJackClientUUID)) return;
-  const auto eff = effectiveLinkPeerName();
-  jack_set_property(mJackClient, mJackClientUUID, linkaudio_peer_name_key.c_str(),
-                    eff.c_str(), string_type);
-}
-
-// Publish the current receiver playout buffer (ms) so a client reflects the applied value.
-void JackTransportLink::setLinkAudioLatencyMsProperty() {
-  sendLinkAudioLatencyMs();
-  if (jack_uuid_empty(mJackClientUUID)) return;
-  std::string s = std::to_string(mLatencyMs.load(std::memory_order_acquire));
-  jack_set_property(mJackClient, mJackClientUUID, linkaudio_latency_key.c_str(),
-                    s.c_str(), decimal_type);
-}
-
-// Publish the current "Sync to Incoming Audio" toggle so a client reflects the applied value.
-void JackTransportLink::setLinkAudioSyncToIncomingProperty() {
-  sendLinkAudioSyncToIncoming();
-  if (jack_uuid_empty(mJackClientUUID)) return;
-  const char* s = mSyncToIncomingAudio.load(std::memory_order_acquire) ? "true" : "false";
-  jack_set_property(mJackClient, mJackClientUUID, linkaudio_sync_key.c_str(), s, bool_type);
-}
-
 // Recompute the effective peer name; rename the Link peer only when it changed (setPeerName
-// is thread-safe/non-RT), then always republish so readers reflect the current value.
+// is thread-safe/non-RT), then always re-send so readers reflect the current value.
 void JackTransportLink::applyLinkPeerName() {
   const auto eff = effectiveLinkPeerName();
   if (eff != mAppliedLinkPeerName) {
     mLink.setPeerName(eff);
     mAppliedLinkPeerName = eff;
   }
-  setLinkAudioPeerNameProperty();
-}
-
-// jackd logs a "DB_NOTFOUND" error when asked to remove a property that was never set,
-// so guard removal on existence to avoid that log spam.
-void JackTransportLink::removePropertyIfExists(const std::string& key) {
-  if (jack_uuid_empty(mJackClientUUID)) return;
-  std::string v, t;
-  if (get_property(mJackClientUUID, key, v, t))
-    jack_remove_property(mJackClient, mJackClientUUID, key.c_str());
+  sendLinkAudioPeerName();
 }
 
 // Set the port-group + pretty-name on our own audio ports so patchbays present them as a
@@ -1963,7 +1670,7 @@ void JackTransportLink::reconcileSinks(const std::vector<DesiredSink>& desired) 
       mUpdatePortMeta = true;
       mNeedsSaveConfig = true;
     }
-    setLinkAudioSinksProperty();
+    sendLinkAudioSinks();
     return;
   }
 
@@ -2023,7 +1730,7 @@ void JackTransportLink::reconcileSinks(const std::vector<DesiredSink>& desired) 
   }
 
   mSinkOrder = std::move(order);
-  setLinkAudioSinksProperty();
+  sendLinkAudioSinks();
   mUpdatePortMeta = true;
   mNeedsSaveConfig = true;
 }
@@ -2086,7 +1793,7 @@ void JackTransportLink::reconcileSources(const std::vector<DesiredSource>& desir
       mUpdatePortMeta = true;
       mNeedsSaveConfig = true;
     }
-    setLinkAudioSourcesProperty();
+    sendLinkAudioSources();
     return;
   }
 
@@ -2127,7 +1834,7 @@ void JackTransportLink::reconcileSources(const std::vector<DesiredSource>& desir
   }
 
   mSourceOrder = std::move(order);
-  setLinkAudioSourcesProperty();
+  sendLinkAudioSources();
   mUpdatePortMeta = true;
   mNeedsSaveConfig = true;
   mNeedsSourceUpdate.store(true, std::memory_order_release);

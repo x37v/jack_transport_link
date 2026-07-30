@@ -111,10 +111,8 @@ private:
   // so the slot-vector reads are serialized with reconcileSinks/Sources on the same thread.
   void updateLatencyRanges();
   // Fold auto-detected latency + user trim (ms) into the effective frame offsets (atomics
-  // read by the RT process callback) and republish the read-only latency metadata.
+  // read by the RT process callback) and re-send the read-only latency values.
   void recomputeEffectiveLatency();
-  // Publish effective + auto capture/playback latency (ms) as read-only JACK metadata.
-  void setLinkAudioLatencyProperties();
 
   // The Link Audio state push. Each of these builds its payload, compares it against what was last
   // sent and queues a datagram only on a real change — and each returns before building anything
@@ -143,22 +141,11 @@ private:
   void setEnableStartStopProperty(bool enable);
   void setSyncProperty(bool sync);
   void setNumPeersProperty(size_t peers);
-  void setLinkAudioChannelsProperty(const std::vector<ableton::LinkAudio::Channel>& channels);
-  // Publish the canonical (key-tagged, display-ordered) sink/source lists. Each only writes
-  // when the metadata doesn't already hold the canonical value, which both filters our own
-  // echo and corrects a rejected client write back to the applied value.
-  void setLinkAudioSinksProperty();
-  void setLinkAudioSourcesProperty();
-  void setLinkAudioSourceStatusProperty();
-  void setLinkAudioLatencyMsProperty();
-  void setLinkAudioSyncToIncomingProperty();
   void setLinkEnabledProperty();
-  void removePropertyIfExists(const std::string& key);
   // Effective Link peer name = override (mLinkPeerName, if non-empty) else the hostname.
   std::string effectiveLinkPeerName() const;
-  // Recompute the effective peer name; if it changed, rename the Link peer and republish.
+  // Recompute the effective peer name; if it changed, rename the Link peer and re-send it.
   void applyLinkPeerName();
-  void setLinkAudioPeerNameProperty();
   bool updateLinkAudioSource();
   void updateAudioPortMetadata();
   // Zero the cumulative dropout count of one source (by slot key) or of every source
@@ -342,21 +329,17 @@ private:
   std::atomic<bool> mNeedsApplyLinkEnabled{false};
   std::atomic<bool> mNeedsPublishLinkEnabled{false};
 
-  // Desired sink/source lists staged by the metadata + OSC handlers, applied (reconciled)
-  // in processEvents. Guarded by mControlMutex.
+  // Desired sink/source lists staged by the OSC handlers, applied (reconciled) in processEvents.
+  // Guarded by mControlMutex.
   std::vector<DesiredSink> mDesiredSinks;
   std::vector<DesiredSource> mDesiredSources;
   std::atomic<bool> mNeedsReconcileSinks{false};
   std::atomic<bool> mNeedsReconcileSources{false};
-  // The canonical JSON we last published for the sink/source lists, used to skip re-parsing
-  // our own property-change echo.
-  std::string mPublishedSinksJson;
-  std::string mPublishedSourcesJson;
   std::atomic<bool> mNeedsSourceUpdate{false};
   std::atomic<bool> mReportLinkAudioChannels{false};
   std::atomic<bool> mReportLinkAudioSource{false};
-  // Pending dropout-count reset requested via metadata; drained in processEvents, which also
-  // removes the command property (jack_remove_property is illegal on the notification thread).
+  // Pending dropout-count reset requested over OSC; drained in processEvents, since the reset also
+  // re-sends the status and sends have to happen on the main thread.
   std::string mResetDropoutsTarget;
   std::atomic<bool> mNeedsResetDropouts{false};
 
