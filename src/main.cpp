@@ -1,4 +1,5 @@
 #include "JackTransportLink.hpp"
+#include "OscIO.hpp"
 
 #include <OptionParser.h>
 #include <chrono>
@@ -7,10 +8,7 @@
 #include <fstream>
 #include <thread>
 
-#include <ip/UdpSocket.h>
 #include <nlohmann/json.hpp>
-#include <osc/OscPacketListener.h>
-#include <osc/OscReceivedElements.h>
 
 #include <iostream>
 
@@ -155,10 +153,18 @@ int main(int argc, char *argv[]) {
       .set_default("");
   parser.add_option("-o", "--osc-port")
       .type("int")
-      .help("the name to give to the jack client, default: %default")
+      .help("the UDP port to receive OSC on. An explicit port is used as given and jtl exits if "
+            "it can't be bound; the default is searched upwards over a small range. default: "
+            "%default")
       .action("store")
       .dest("oscport")
-      .set_default("-1");
+      .set_default("3234");
+  parser.add_option("--no-osc")
+      .action("store_false")
+      .dest("osc_enabled")
+      .set_default("1")
+      .help("Disable the OSC interface entirely. Enabled by default; note that the Link Audio "
+            "bridge is OSC-only, so a client will report Link Audio unavailable.");
 
   parser.add_option("-c", "--config")
       .type("string")
@@ -255,7 +261,12 @@ int main(int argc, char *argv[]) {
       ? (double)options.get("ticks")
       : configValue(cfg, "ticks_per_beat", (double)options.get("ticks"));
   std::string name = options["name"];
+  // Deliberately no config-file tier for the OSC port, unlike every other option here: the port is
+  // discovery-published as JACK metadata, and a config-supplied value would raise an unanswerable
+  // question about whether it counts as "explicit" (hard-fail on conflict) or "default" (iterate).
   int oscport = options.get("oscport");
+  const bool oscportExplicit = options.is_set_by_user("oscport");
+  const bool oscEnabled = static_cast<bool>(options.get("osc_enabled"));
   bool enableLinkAudio = options.is_set_by_user("link_audio")
       ? static_cast<bool>(options.get("link_audio"))
       : configValue(cfg, "link_audio_enabled",
@@ -316,7 +327,42 @@ int main(int argc, char *argv[]) {
     return -1;
   }
 
-  std::unique_ptr<oscpack::UdpListeningReceiveSocket> oscsocket;
+  // Bind the OSC socket once, before the JACK loop, so its port and its registered listeners both
+  // survive a JACK server restart (see OscIO). A jtl with no OSC socket has no Link Audio bridge at
+  // all, so every failure here is fatal rather than a silent degradation — on a headless device a
+  // failed unit is far easier to diagnose than a quietly half-working one.
+  OscIO osc;
+  if (oscEnabled) {
+    if (oscport < 1 || oscport > 65535) {
+      // In particular -o 0 is an error, not "off" (that's --no-osc) and not "ephemeral": port 0
+      // conventionally means "let the OS pick", which is the meaning to reserve it for.
+      std::cerr << "osc port " << oscport << " is out of range (1-65535)" << std::endl;
+      return -1;
+    }
+    if (oscportExplicit) {
+      if (!osc.bind(oscport)) {
+        std::cerr << "could not bind osc port " << oscport << std::endl;
+        return -1;
+      }
+    } else {
+      const int last = oscport + 15;
+      for (int p = oscport; p <= last && p <= 65535; p++) {
+        if (osc.bind(p)) break;
+      }
+      if (!osc.bound()) {
+        std::cerr << "could not bind an osc port in the range " << oscport << "-" << last
+                  << std::endl;
+        return -1;
+      }
+    }
+    std::cout << "osc listening on port " << osc.port() << std::endl;
+  }
+
+  // One OSC thread for the life of the process, not one per JACK session.
+  std::thread oscthread;
+  if (osc.bound())
+    oscthread = std::thread([&osc]() { osc.run(); });
+
   while (run.load()) {
     jack_status_t status;
     auto client = jack_client_open(name.c_str(), jackOptions, &status);
@@ -330,36 +376,18 @@ int main(int argc, char *argv[]) {
                           initialSyncLink, configPath,
                           sinkNames, sources, linkPeerName,
                           captureLatencyTrimMs, playbackLatencyTrimMs, latencyMs,
-                          syncToIncomingAudio, linkEnabled);
+                          syncToIncomingAudio, linkEnabled, &osc);
 
-      if (oscport > 0) {
-        try {
-          oscpack::IpEndpointName oscendpoint(
-              oscpack::IpEndpointName::ANY_ADDRESS, oscport);
-          oscsocket = std::make_unique<oscpack::UdpListeningReceiveSocket>(
-              oscendpoint, &j);
-        } catch (std::runtime_error &e) {
-          std::cerr << "error creating osc socket " << e.what() << std::endl;
-        }
-      }
-
-      // run osc in a thread
-      std::thread oscthread;
-      if (oscsocket) {
-        oscthread = std::thread([&oscsocket]() { oscsocket->Run(); });
-      }
+      // Route inbound OSC at j for as long as it lives. setTarget(nullptr) below blocks until any
+      // in-flight message has been handled, so j is never destroyed out from under the OSC thread.
+      osc.setTarget(&j);
 
       while (run.load() && runSession.load()) {
         std::this_thread::sleep_for(runPollPeriod);
         j.processEvents();
       }
 
-      // cleanup osc
-      if (oscthread.joinable() && oscsocket) {
-        oscsocket->AsynchronousBreak();
-        oscthread.join();
-      }
-      oscsocket.reset();
+      osc.setTarget(nullptr);
     } else {
       // sleep and check for poll period timeout
       using std::chrono::system_clock;
@@ -368,6 +396,11 @@ int main(int argc, char *argv[]) {
         std::this_thread::sleep_for(runPollPeriod);
       }
     }
+  }
+
+  if (oscthread.joinable()) {
+    osc.stop();
+    oscthread.join();
   }
   return 0;
 }

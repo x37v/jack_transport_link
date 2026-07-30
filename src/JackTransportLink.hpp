@@ -19,7 +19,7 @@
 #include <ableton/platforms/Config.hpp>
 #include "LinkAudioRenderer.hpp"
 
-#include <osc/OscPacketListener.h>
+#include <ip/IpEndpointName.h>
 #include <osc/OscReceivedElements.h>
 
 // Every atomic type touched by a JACK realtime callback must be implemented
@@ -29,7 +29,9 @@ static_assert(std::atomic<float>::is_always_lock_free);
 static_assert(std::atomic<jack_nframes_t>::is_always_lock_free);
 static_assert(std::atomic<size_t>::is_always_lock_free);
 
-class JackTransportLink : public oscpack::OscPacketListener {
+class OscIO;
+
+class JackTransportLink {
 public:
   using SinkRenderer = ableton::linkaudio::LinkAudioSinkRenderer<ableton::LinkAudio>;
   using SourceRenderer = ableton::linkaudio::LinkAudioSourceRenderer<ableton::LinkAudio>;
@@ -68,10 +70,21 @@ public:
                     double playbackLatencyTrimMs = 0.0,
                     double latencyMs = 100.0,
                     bool syncToIncomingAudio = true,
-                    bool linkEnabled = true);
+                    bool linkEnabled = true,
+                    OscIO *osc = nullptr);
   ~JackTransportLink();
 
   void processEvents();
+
+  // Handle one inbound OSC message. Called on the OSC thread by OscIO, which owns the socket and
+  // is itself the oscpack PacketListener — we're no longer *a* packet listener, we just handle
+  // messages.
+  void processOscMessage(const oscpack::ReceivedMessage &m,
+                         const oscpack::IpEndpointName &remoteEndpoint);
+  // A listener registered (or re-registered) and is owed a full state snapshot. Called on the OSC
+  // thread; the send itself has to happen on the main thread, so this only stages the endpoint and
+  // processEvents drains it.
+  void requestOscSnapshot(const oscpack::IpEndpointName &endpoint);
 
   static int processCallback(jack_nframes_t nframes, void *arg);
   static void timeBaseCallback(jack_transport_state_t state,
@@ -83,11 +96,10 @@ public:
                                      jack_property_change_t change, void *arg);
   static void latencyCallback(jack_latency_callback_mode_t mode, void *arg);
 
-protected:
-  virtual void ProcessMessage(const oscpack::ReceivedMessage &m,
-                              const oscpack::IpEndpointName &remoteEndpoint);
-
 private:
+  // The body of processEvents, run with mControlMutex held. Split out so the lock is released
+  // before flushOsc() issues its syscalls.
+  void processEventsLocked();
   int processCallback(jack_nframes_t nframes);
   void timeBaseCallback(jack_transport_state_t state, jack_nframes_t nframes,
                         jack_position_t *pos, bool posIsNew);
@@ -103,6 +115,30 @@ private:
   void recomputeEffectiveLatency();
   // Publish effective + auto capture/playback latency (ms) as read-only JACK metadata.
   void setLinkAudioLatencyProperties();
+
+  // The Link Audio state push. Each of these builds its payload, compares it against what was last
+  // sent and queues a datagram only on a real change — and each returns before building anything
+  // when no listener is registered, which is what makes the 4 Hz telemetry timer free on an
+  // idle device.
+  void sendLinkAudioAvailable();
+  void sendLinkAudioChannels(const std::vector<ableton::LinkAudio::Channel>& channels);
+  void sendLinkAudioPeerName();
+  void sendLinkAudioLatencyMs();
+  void sendLinkAudioSyncToIncoming();
+  void sendLinkAudioSinks();
+  void sendLinkAudioSources();
+  void sendLinkAudioSourceStatus();
+  void sendLinkAudioLatencies();
+  // Payload builders, shared by the guarded senders and the unconditional snapshot path.
+  std::string buildChannelsJson(
+      const std::vector<ableton::LinkAudio::Channel>& channels) const;
+  std::string buildSinksJson() const;
+  std::string buildSourcesJson() const;
+  std::string buildSourceStatusJson() const;
+  // Publish the OSC port we actually bound, so a client can find us. This is the whole discovery
+  // protocol: JACK wipes a client's properties when it disconnects, so this key disappearing and
+  // reappearing *is* the "jack_transport_link restarted, re-register with me" signal.
+  void setOscPortProperty();
   void setBPMProperty(double bpm);
   void setEnableStartStopProperty(bool enable);
   void setSyncProperty(bool sync);
@@ -159,7 +195,24 @@ private:
 
   void invalidateClockSyncBBT();
 
+  // Queue one already-encoded datagram for sending. Encoding here (under mControlMutex) is
+  // correct — it reads guarded state — but the syscall must not happen under the lock, so
+  // processEvents flushes the outbox after releasing it.
+  void queueOsc(std::string packet);
+  void queueOscTo(const oscpack::IpEndpointName &endpoint, std::string packet);
+  // Drain the outbox onto the socket. Only caller is processEvents: main thread, no locks held.
+  void flushOsc();
+  // Send every state address to one endpoint, unconditionally (no change guard) — this is what a
+  // freshly-registered listener gets so it starts from a complete picture.
+  void sendOscSnapshot(const oscpack::IpEndpointName &endpoint);
+  // Re-send the low-rate state to every listener, bypassing the change guards. Counterweight to
+  // those guards: a lost datagram can't leave a client stale indefinitely.
+  void republishOscState();
+
   jack_client_t *mJackClient;
+  // Not owned; outlives us (constructed in main outside the JACK reconnect loop). With --no-osc it
+  // is present but unbound, so it can never gain a listener and every send gates itself off.
+  OscIO *mOsc = nullptr;
 
   // mSampleRate must precede the slot vectors (renderers hold a reference to it)
   double mSampleRate;
@@ -237,6 +290,9 @@ private:
   std::atomic<bool> mReportBPM{false};
   std::atomic<bool> mReportLinkSync{false};
   std::atomic<bool> mReportStartStopEnable{false};
+  // Peer count recorded by Link's callback thread, published from processEvents.
+  std::atomic<size_t> mNumPeers{0};
+  std::atomic<bool> mReportNumPeers{false};
 
   std::atomic<bool> mChannelsChanged{false};
   bool mLinkAudioEnabled = false;
@@ -309,6 +365,34 @@ private:
   std::chrono::steady_clock::time_point mLastConfigSave{};
   // Throttle for periodic source-status metadata publishing (see processEvents).
   std::chrono::steady_clock::time_point mLastHealthPublish{};
+
+  // Encoded datagrams waiting to go out, in order. `broadcast` = every listener; otherwise the
+  // single endpoint in `dest` (the snapshot path). Guarded by mControlMutex.
+  struct OscOut {
+    bool broadcast = true;
+    oscpack::IpEndpointName dest;
+    std::string packet;
+  };
+  std::vector<OscOut> mOscOutbox;
+  // What the listeners were last sent, per state address; a send whose payload matches is skipped.
+  // nullopt = never sent, which always sends — that's also how the periodic re-publish forces one.
+  std::optional<bool> mSentAvailable;
+  std::optional<std::string> mSentChannelsJson;
+  std::optional<std::string> mSentPeerName;
+  std::optional<float> mSentLatencyMs;
+  std::optional<bool> mSentSyncToIncoming;
+  std::optional<std::string> mSentSinksJson;
+  std::optional<std::string> mSentSourcesJson;
+  std::optional<std::string> mSentSourceStatusJson;
+  std::optional<float> mSentCaptureLatencyMs;
+  std::optional<float> mSentPlaybackLatencyMs;
+  std::optional<float> mSentCaptureLatencyAutoMs;
+  std::optional<float> mSentPlaybackLatencyAutoMs;
+  // Listeners owed a full snapshot, staged from the OSC thread. Guarded by mControlMutex.
+  std::vector<oscpack::IpEndpointName> mPendingOscSnapshots;
+  std::atomic<bool> mNeedsOscSnapshots{false};
+  // Throttle for the periodic low-rate re-publish (see republishOscState).
+  std::chrono::steady_clock::time_point mLastOscRepublish{};
 
   // The effective Link peer name currently announced (mirrors mLink's peer name), so
   // applyLinkPeerName() only calls setPeerName() when it actually changes.
