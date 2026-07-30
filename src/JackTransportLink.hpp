@@ -2,10 +2,12 @@
 
 #include <atomic>
 #include <chrono>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <jack/jack.h>
@@ -34,6 +36,22 @@ public:
 
   enum class MIDIClockRunState { Running, Stopped, NeedsSync };
 
+  // A requested (desired) sink. `key` binds the entry to an existing slot — that's how a
+  // rename is expressed (same key, different name). An entry with only a name is
+  // self-keying, since the key is derived from the name.
+  struct DesiredSink {
+    std::string key;
+    std::string name;
+  };
+  // A requested (desired) source. An entry carrying a channel name is identity-bearing
+  // (matched by exact peer + channel); an entry with only a key refers to an existing slot
+  // and adopts its identity (used by order-only writes).
+  struct DesiredSource {
+    std::string key;
+    std::string peer;
+    std::string channel;
+  };
+
   JackTransportLink(jack_client_t *client,
                     bool enableStartStopSync = true,
                     double initialBPM = 100.,
@@ -41,12 +59,10 @@ public:
                     float initialTimeSigDenom = 4.,
                     double initialTicksPerBeat = 1920.,
                     bool enableLinkAudio = true,
-                    size_t linkAudioStereoInChannels = 1,
-                    size_t linkAudioStereoOutChannels = 0,
                     bool syncLink = true,
                     std::string configPath = "",
                     std::vector<std::string> sinkNames = {},
-                    std::vector<std::string> sourceNames = {},
+                    std::vector<std::pair<std::string, std::string>> sources = {},
                     std::string linkPeerName = "",
                     double captureLatencyTrimMs = 0.0,
                     double playbackLatencyTrimMs = 0.0,
@@ -56,7 +72,6 @@ public:
   ~JackTransportLink();
 
   void processEvents();
-  void applySourceFiltersFromConfig(const std::string& jsonText);
 
   static int processCallback(jack_nframes_t nframes, void *arg);
   static void timeBaseCallback(jack_transport_state_t state,
@@ -79,9 +94,9 @@ private:
   int syncCallback(jack_transport_state_t state, jack_position_t *pos);
   void propertyChangeCallback(jack_uuid_t subject, const char *key,
                               jack_property_change_t change);
-  // Re-read JACK's measured capture/playback latency from our in_N/out_N ports, then recompute
+  // Re-read JACK's measured capture/playback latency from our slot ports, then recompute
   // effective values. Called from processEvents (main thread) — NOT from the latency callback —
-  // so the port-vector reads are serialized with rebuildAudioPorts() on the same thread.
+  // so the slot-vector reads are serialized with reconcileSinks/Sources on the same thread.
   void updateLatencyRanges();
   // Fold auto-detected latency + user trim (ms) into the effective frame offsets (atomics
   // read by the RT process callback) and republish the read-only latency metadata.
@@ -93,39 +108,61 @@ private:
   void setSyncProperty(bool sync);
   void setNumPeersProperty(size_t peers);
   void setLinkAudioChannelsProperty(const std::vector<ableton::LinkAudio::Channel>& channels);
-  void setLinkAudioSourceProperty();
-  void setLinkAudioSourceHealthProperty();
+  // Publish the canonical (key-tagged, display-ordered) sink/source lists. Each only writes
+  // when the metadata doesn't already hold the canonical value, which both filters our own
+  // echo and corrects a rejected client write back to the applied value.
+  void setLinkAudioSinksProperty();
+  void setLinkAudioSourcesProperty();
+  void setLinkAudioSourceStatusProperty();
   void setLinkAudioLatencyMsProperty();
   void setLinkAudioSyncToIncomingProperty();
   void setLinkEnabledProperty();
-  void setLinkAudioSourceFiltersProperty();
-  void setLinkAudioInStereoChannelsProperty(size_t n);
-  void setLinkAudioOutStereoChannelsProperty(size_t n);
   void removePropertyIfExists(const std::string& key);
-  void setLinkAudioSlotNameProperty(const std::string& key, const std::string& name);
-  void setLinkAudioSinkNameProperty(size_t i);
-  void setLinkAudioSourceNameProperty(size_t i);
   // Effective Link peer name = override (mLinkPeerName, if non-empty) else the hostname.
   std::string effectiveLinkPeerName() const;
   // Recompute the effective peer name; if it changed, rename the Link peer and republish.
   void applyLinkPeerName();
   void setLinkAudioPeerNameProperty();
   bool updateLinkAudioSource();
-  std::string effectiveSinkName(size_t i) const;
-  std::string linkAudioSourcePortLabel(size_t i);
   void updateAudioPortMetadata();
-  void applySinkNames();
-  void rebuildAudioPorts(size_t newIn, size_t newOut);
+  // Zero the cumulative dropout count of one source (by slot key) or of every source
+  // (target empty or "*"), and republish the status so the client sees the zeroes at once.
+  void resetSourceDropouts(const std::string& target);
+  // Reconcile the live slots against a desired list: add / remove / rename / reorder in one
+  // idempotent pass. A reorder-only change touches nothing the RT thread reads.
+  void reconcileSinks(const std::vector<DesiredSink>& desired);
+  void reconcileSources(const std::vector<DesiredSource>& desired);
+  // jack_deactivate() drops *all* of our ports' connections, not just the affected slot's, so
+  // reconcile snapshots every connection (including the MIDI clock out) and restores it by name.
+  struct PortConn { std::string mine; std::string other; bool output; };
+  std::vector<PortConn> snapshotConnections() const;
+  // `rename` maps an old port name to its replacement, so a renamed slot's live connections
+  // follow it onto its new (re-hashed) ports.
+  void restoreConnections(const std::vector<PortConn>& conns,
+                          const std::map<std::string, std::string>& rename);
+  // Register the stereo port pair for a slot: in_<key>_l/_r for sinks, out_<key>_l/_r for
+  // sources. Identity-derived, so the same identity always gets the same port names.
+  void registerSlotPorts(const std::string& key, bool input,
+                         jack_port_t*& portL, jack_port_t*& portR);
+  // The desired list staged for the next reconcile. Seeded from the live slots unless a
+  // reconcile is already pending (so back-to-back commands compose). Caller holds mControlMutex
+  // and must set the matching mNeedsReconcile* flag.
+  std::vector<DesiredSink>& pendingSinks();
+  std::vector<DesiredSource>& pendingSources();
+  // Slot lookup; returns npos when absent. findSink() accepts a name or a key (for the OSC
+  // commands, which take a human-typed identifier); findSinkByKey() is the internal, key-only
+  // form used wherever the caller already has a key.
+  size_t findSinkByKey(const std::string& key) const;
+  size_t findSink(const std::string& nameOrKey) const;
+  size_t findSource(const std::string& key) const;
   void saveConfig();
 
   void invalidateClockSyncBBT();
 
   jack_client_t *mJackClient;
 
-  // mSampleRate must precede mRenderers
+  // mSampleRate must precede the slot vectors (renderers hold a reference to it)
   double mSampleRate;
-  size_t mNumStereoInChannels;
-  size_t mNumStereoOutChannels;
   // Serializes non-real-time control operations arriving from the main loop,
   // JACK metadata callback, and OSC thread. Recursive because these operations
   // call helpers that also take a snapshot under the same lock.
@@ -134,8 +171,37 @@ private:
   // constructor seeds mLink's peer name from effectiveLinkPeerName(), which reads it.
   std::string mLinkPeerName;
   ableton::LinkAudio mLink;
-  std::vector<std::unique_ptr<SinkRenderer>> mSendRenderers;    // one per stereo in pair
-  std::vector<std::unique_ptr<SourceRenderer>> mRecvRenderers;  // one per stereo out pair
+
+  // An outgoing (send) slot: a named stereo channel announced to the Link session, fed by the
+  // JACK input port pair in_<key>_l / in_<key>_r. Identity = the announced name.
+  struct SinkSlot {
+    std::string name;   // announced Link channel name; non-empty and unique
+    std::string key;    // slotKey(name) — recomputed on rename
+    std::unique_ptr<SinkRenderer> renderer;
+    jack_port_t* portL = nullptr;
+    jack_port_t* portR = nullptr;
+  };
+  // An incoming (receive) slot: subscribes to one exact advertised peer/channel and writes it
+  // to the JACK output port pair out_<key>_l / out_<key>_r. Identity = peer + channel.
+  struct SourceSlot {
+    std::string peer;
+    std::string channel;
+    std::string key;    // slotKey(peer + '\0' + channel)
+    std::unique_ptr<SourceRenderer> renderer;
+    jack_port_t* portL = nullptr;
+    jack_port_t* portR = nullptr;
+    std::optional<ableton::ChannelId> currentId; // live connection; nullopt = disconnected
+  };
+  // Creation order, read by the RT process callback. Only ever mutated inside a
+  // jack_deactivate() window (see reconcileSinks/reconcileSources), so the RT thread never
+  // observes a partially-updated vector and no extra atomic is needed.
+  std::vector<SinkSlot> mSinks;
+  std::vector<SourceSlot> mSources;
+  // Display order (slot keys), main thread only. Kept separate from the slot vectors so a
+  // reorder only permutes these + republishes ORDER port metadata — no deactivate, so a
+  // purely cosmetic change never drops a connection.
+  std::vector<std::string> mSinkOrder;
+  std::vector<std::string> mSourceOrder;
 
   jack_port_t *mMIDIClockOut = nullptr;
   MIDIClockRunState mMIDIClockRunState = MIDIClockRunState::Stopped;
@@ -172,10 +238,12 @@ private:
   std::atomic<bool> mReportLinkSync{false};
   std::atomic<bool> mReportStartStopEnable{false};
 
-  std::vector<jack_port_t*> mAudioIns;  // 2 * mNumStereoInChannels ports
-  std::vector<jack_port_t*> mAudioOuts; // 2 * mNumStereoOutChannels ports
   std::atomic<bool> mChannelsChanged{false};
   bool mLinkAudioEnabled = false;
+  // true once jack_activate() has run, so reconcile knows whether it needs to bracket its
+  // port/renderer mutations with deactivate/activate (the constructor builds the initial
+  // slots before the client is ever activated).
+  bool mJackActivated = false;
 
   // I/O latency compensation. The send path stamps audio to the beat it was actually
   // captured at (mTimeNext - capture latency); the receive path targets the beat the audio
@@ -218,36 +286,30 @@ private:
   std::atomic<bool> mNeedsApplyLinkEnabled{false};
   std::atomic<bool> mNeedsPublishLinkEnabled{false};
 
-  // Per-receiver source filters — written from property/OSC callbacks, read in processEvents.
-  // Empty string = any (auto). Guarded by mSourceFilterMutex.
-  mutable std::mutex mSourceFilterMutex;
-  std::vector<std::string> mLinkAudioPeerFilters;
-  std::vector<std::string> mLinkAudioChannelFilters;
-  // Per-renderer connection state
-  std::vector<std::optional<ableton::ChannelId>> mCurrentSourceChannelIds;
-  std::vector<std::string> mCurrentSourcePeerNames;
-  std::vector<std::string> mCurrentSourceChannelNames;
+  // Desired sink/source lists staged by the metadata + OSC handlers, applied (reconciled)
+  // in processEvents. Guarded by mControlMutex.
+  std::vector<DesiredSink> mDesiredSinks;
+  std::vector<DesiredSource> mDesiredSources;
+  std::atomic<bool> mNeedsReconcileSinks{false};
+  std::atomic<bool> mNeedsReconcileSources{false};
+  // The canonical JSON we last published for the sink/source lists, used to skip re-parsing
+  // our own property-change echo.
+  std::string mPublishedSinksJson;
+  std::string mPublishedSourcesJson;
   std::atomic<bool> mNeedsSourceUpdate{false};
-  std::atomic<int> mRequestedStereoInChannels{-1};
-  std::atomic<int> mRequestedStereoOutChannels{-1};
   std::atomic<bool> mReportLinkAudioChannels{false};
   std::atomic<bool> mReportLinkAudioSource{false};
-  std::atomic<bool> mReportLinkAudioSourceFilters{false};
+  // Pending dropout-count reset requested via metadata; drained in processEvents, which also
+  // removes the command property (jack_remove_property is illegal on the notification thread).
+  std::string mResetDropoutsTarget;
+  std::atomic<bool> mNeedsResetDropouts{false};
 
   std::string mConfigPath;
   std::atomic<bool> mNeedsSaveConfig{false};
   std::chrono::steady_clock::time_point mLastConfigSave{};
-  // Throttle for periodic source-health metadata publishing (see processEvents).
+  // Throttle for periodic source-status metadata publishing (see processEvents).
   std::chrono::steady_clock::time_point mLastHealthPublish{};
 
-  // Per-slot user names. Empty = use the default ("Send N" for sinks).
-  // mSinkNames tracks the outgoing (SinkRenderer / in_N) slots, mSourceNames the
-  // incoming (SourceRenderer / out_N) slots. mAppliedSinkNames mirrors the names
-  // the currently-constructed SinkRenderers announce to the Link session.
-  std::vector<std::string> mSinkNames;
-  std::vector<std::string> mSourceNames;
-  std::vector<std::string> mAppliedSinkNames;
-  std::atomic<bool> mNeedsApplySinkNames{false};
   // The effective Link peer name currently announced (mirrors mLink's peer name), so
   // applyLinkPeerName() only calls setPeerName() when it actually changes.
   std::string mAppliedLinkPeerName;

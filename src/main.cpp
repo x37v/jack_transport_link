@@ -172,18 +172,6 @@ int main(int argc, char *argv[]) {
       .set_default("1")
       .help("Disable Link Audio (network audio streaming). Enabled by default.");
 
-  parser.add_option("--link-audio-in-stereo-channels")
-      .type("int")
-      .dest("link_audio_in_stereo_channels")
-      .set_default("1")
-      .help("Number of Link Audio stereo send pairs, default: %default.");
-
-  parser.add_option("--link-audio-out-stereo-channels")
-      .type("int")
-      .dest("link_audio_out_stereo_channels")
-      .set_default("0")
-      .help("Number of Link Audio stereo receive pairs, default: %default.");
-
   parser.add_option("--capture-latency-trim-ms")
       .type("double")
       .dest("capture_latency_trim_ms")
@@ -272,32 +260,28 @@ int main(int argc, char *argv[]) {
       ? static_cast<bool>(options.get("link_audio"))
       : configValue(cfg, "link_audio_enabled",
                     static_cast<bool>(options.get("link_audio")));
-  const int linkAudioInChannelsValue =
-      options.is_set_by_user("link_audio_in_stereo_channels")
-          ? static_cast<int>(options.get("link_audio_in_stereo_channels"))
-          : configValue(
-                cfg, "in_stereo_channels",
-                static_cast<int>(
-                    options.get("link_audio_in_stereo_channels")));
-  const int linkAudioOutChannelsValue =
-      options.is_set_by_user("link_audio_out_stereo_channels")
-          ? static_cast<int>(options.get("link_audio_out_stereo_channels"))
-          : configValue(
-                cfg, "out_stereo_channels",
-                static_cast<int>(
-                    options.get("link_audio_out_stereo_channels")));
   bool initialSyncLink = configValue(cfg, "sync", true);
 
-  auto loadNames = [&](const char* key) -> std::vector<std::string> {
-    std::vector<std::string> out;
-    if (cfg.contains(key) && cfg[key].is_array()) {
-      for (const auto& v : cfg[key])
-        out.push_back(v.is_string() ? v.get<std::string>() : std::string());
+  // Explicit sink/source lists, in display order. Slot keys aren't persisted — jack_transport_link
+  // re-derives them from these identities, so the JACK port names come back the same.
+  std::vector<std::string> sinkNames;
+  if (cfg.contains("sinks") && cfg["sinks"].is_array()) {
+    for (const auto& v : cfg["sinks"]) {
+      if (!v.is_object()) continue;
+      auto name = v.value("name", std::string());
+      if (!name.empty())
+        sinkNames.push_back(std::move(name));
     }
-    return out;
-  };
-  std::vector<std::string> sinkNames   = loadNames("sink_names");
-  std::vector<std::string> sourceNames = loadNames("source_names");
+  }
+  std::vector<std::pair<std::string, std::string>> sources;
+  if (cfg.contains("sources") && cfg["sources"].is_array()) {
+    for (const auto& v : cfg["sources"]) {
+      if (!v.is_object()) continue;
+      auto channel = v.value("channel", std::string());
+      if (channel.empty()) continue;
+      sources.emplace_back(v.value("peer", std::string()), std::move(channel));
+    }
+  }
 
   // Link peer-name override (empty = auto/hostname): CLI wins over config.
   std::string linkPeerName = options.is_set_by_user("link_name")
@@ -327,16 +311,10 @@ int main(int argc, char *argv[]) {
                     (bool)options.get("link_enabled"));
 
   if (initialBPM <= 0.0 || initialQuantum < 1.0 || initialTimeSigDenom < 1.0 ||
-      initialTicksPerBeat < 1.0 || linkAudioInChannelsValue < 0 ||
-      linkAudioInChannelsValue > 64 || linkAudioOutChannelsValue < 0 ||
-      linkAudioOutChannelsValue > 64) {
+      initialTicksPerBeat < 1.0) {
     std::cerr << "one or more numeric options are out of range" << std::endl;
     return -1;
   }
-  const size_t linkAudioInChannels =
-      static_cast<size_t>(linkAudioInChannelsValue);
-  const size_t linkAudioOutChannels =
-      static_cast<size_t>(linkAudioOutChannelsValue);
 
   std::unique_ptr<oscpack::UdpListeningReceiveSocket> oscsocket;
   while (run.load()) {
@@ -348,14 +326,11 @@ int main(int argc, char *argv[]) {
       JackTransportLink j(client, enableStartStopSync, initialBPM,
                           initialQuantum, initialTimeSigDenom,
                           initialTicksPerBeat,
-                          enableLinkAudio, linkAudioInChannels,
-                          linkAudioOutChannels,
+                          enableLinkAudio,
                           initialSyncLink, configPath,
-                          sinkNames, sourceNames, linkPeerName,
+                          sinkNames, sources, linkPeerName,
                           captureLatencyTrimMs, playbackLatencyTrimMs, latencyMs,
                           syncToIncomingAudio, linkEnabled);
-      if (cfg.contains("source_filters"))
-        j.applySourceFiltersFromConfig(cfg["source_filters"].dump());
 
       if (oscport > 0) {
         try {

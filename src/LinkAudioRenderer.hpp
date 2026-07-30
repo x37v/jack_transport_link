@@ -106,6 +106,12 @@ public:
     auto silenceOutputs = [&]() {
       for (size_t ch = 0; ch < mNumChannels; ++ch)
         std::fill_n(ppChannels[ch], numFrames, 0.0);
+      // Every path that silences also clears moStartReadPos, so the *next* block is treated as
+      // pre-roll again and mDropoutCount stops advancing. That makes the dropout count useless
+      // for telling "healthy" apart from "never produced a sample" — e.g. a playout buffer too
+      // small for the network, where the target beat can never be satisfied. mRendering is the
+      // signal that distinguishes them: false here, true only after a block actually renders.
+      mRendering.store(false, std::memory_order_relaxed);
     };
 
     // Make every buffer published by the Link callback visible to this render
@@ -141,12 +147,28 @@ public:
     // owns all queue advancement so the fractional read position remains
     // relative to the first retained slot.
     while (!moStartReadPos && mpQueueReader->numRetainedSlots() > 0) {
-      if ((*mpQueueReader)[0]->mInfo.endBeats(sessionState, quantum) <
-          targetBeatsAtBufferBegin) {
+      const auto headEnd =
+          (*mpQueueReader)[0]->mInfo.endBeats(sessionState, quantum);
+      if (!headEnd) {
+        // beginBeats/endBeats return nullopt when the buffer was stamped in a
+        // *different Link session*, so its beat time cannot be placed on our
+        // timeline at all. Dropping it is the only option, but it must be
+        // counted: this is otherwise indistinguishable from "nothing is
+        // arriving", and no latency value can fix it.
+        //
+        // Comparing the optional directly (as this used to) silently swallowed
+        // the case — `std::optional` mixed comparison defines `nullopt < v` as
+        // *true* for every v, so such a buffer always looked "too old" and was
+        // discarded no matter how large the playout buffer was.
+        mUnmappableCount.fetch_add(1, std::memory_order_relaxed);
         mpQueueReader->releaseSlot();
-      } else {
-        break;
+        continue;
       }
+      if (*headEnd < targetBeatsAtBufferBegin) {
+        mpQueueReader->releaseSlot();
+        continue;
+      }
+      break;
     }
 
     if (mpQueueReader->numRetainedSlots() == 0) {
@@ -160,29 +182,34 @@ public:
       return;
     }
 
-    if (!moStartReadPos &&
-        (*mpQueueReader)[0]->mInfo.beginBeats(sessionState, quantum) >
-            targetBeatsAtBufferBegin) {
-      // The first received buffer begins in the future relative to the delayed
-      // playout cursor. Preserve it and output pre-roll silence until the
-      // target window catches up.
-      silenceOutputs();
-      moStartReadPos = std::nullopt;
-      mBuffered = 0;
-      return;
-    }
-
     if (!moStartReadPos) {
+      // The loop above released every unmappable head, so the head is mappable here.
+      const auto &info = (*mpQueueReader)[0]->mInfo;
+      const auto startBufferBegin = info.beginBeats(sessionState, quantum);
+      const auto startBufferEnd = info.endBeats(sessionState, quantum);
+
+      if (!startBufferBegin || !startBufferEnd) {
+        mUnmappableCount.fetch_add(1, std::memory_order_relaxed);
+        silenceOutputs();
+        mBuffered = 0;
+        return;
+      }
+
+      if (*startBufferBegin > targetBeatsAtBufferBegin) {
+        // The first received buffer begins in the future relative to the delayed
+        // playout cursor. Preserve it and output pre-roll silence until the
+        // target window catches up.
+        silenceOutputs();
+        mBuffered = 0;
+        return;
+      }
+
       // Convert the target beat into a fractional frame offset within the first
       // usable buffer. Keeping the fraction allows the resampler to align
       // playout more precisely than a whole-frame seek.
-      const auto &info = (*mpQueueReader)[0]->mInfo;
-      const auto startBufferBegin = *info.beginBeats(sessionState, quantum);
-      const auto startBufferEnd = *info.endBeats(sessionState, quantum);
-
       moStartReadPos =
-          linearInterpolate(targetBeatsAtBufferBegin, startBufferBegin,
-                            startBufferEnd, 0.0, double(info.numFrames));
+          linearInterpolate(targetBeatsAtBufferBegin, *startBufferBegin,
+                            *startBufferEnd, 0.0, double(info.numFrames));
     }
 
     const auto startFramePos = *moStartReadPos;
@@ -195,13 +222,23 @@ public:
     // queue head to that endpoint, possibly crossing several network buffers.
     for (auto i = 0u; i < mpQueueReader->numRetainedSlots(); ++i) {
       const auto &info = (*mpQueueReader)[i]->mInfo;
-      const auto bufferBegin = *info.beginBeats(sessionState, quantum);
-      const auto bufferEnd = *info.endBeats(sessionState, quantum);
+      const auto bufferBegin = info.beginBeats(sessionState, quantum);
+      const auto bufferEnd = info.endBeats(sessionState, quantum);
 
-      if (targetBeatsAtBufferEnd >= bufferBegin &&
-          targetBeatsAtBufferEnd < bufferEnd) {
+      // A buffer from a different Link session has no place on our timeline, so it can't
+      // extend the span. Stop here and let the !foundEnd path below report the starve.
+      // (Dereferencing these unconditionally was undefined behaviour: once moStartReadPos
+      // is established the release loop above no longer runs, so an unmappable buffer
+      // reaches this point intact.)
+      if (!bufferBegin || !bufferEnd) {
+        mUnmappableCount.fetch_add(1, std::memory_order_relaxed);
+        break;
+      }
+
+      if (targetBeatsAtBufferEnd >= *bufferBegin &&
+          targetBeatsAtBufferEnd < *bufferEnd) {
         totalFrames +=
-            linearInterpolate(targetBeatsAtBufferEnd, bufferBegin, bufferEnd,
+            linearInterpolate(targetBeatsAtBufferEnd, *bufferBegin, *bufferEnd,
                               0.0, double(info.numFrames));
         foundEnd = true;
         break;
@@ -303,6 +340,7 @@ public:
       buffered += float(info.numFrames) / float(info.sampleRate);
     }
     mBuffered = buffered;
+    mRendering.store(true, std::memory_order_relaxed);
   }
 
   bool hasSource() const { return mpSource != nullptr; }
@@ -335,13 +373,33 @@ public:
       mHasLastArrival = false;
       mJitterMs.store(0.0f, std::memory_order_relaxed);
       mDropoutCount.store(0, std::memory_order_relaxed);
+      mUnmappableCount.store(0, std::memory_order_relaxed);
       mBuffered.store(0.0f, std::memory_order_relaxed);
+      mRendering.store(false, std::memory_order_relaxed);
     }
   }
 
   float buffered() const { return mBuffered; }
+  // True while blocks are actually being filled with received audio. A connected source that
+  // reads false is subscribed but producing pure silence — most often because the playout
+  // buffer is too small to cover the network's arrival delay, which the dropout count cannot
+  // report (it only counts starves *after* playback has started).
+  bool receiving() const { return mRendering.load(std::memory_order_relaxed); }
   uint32_t dropoutCount() const {
     return mDropoutCount.load(std::memory_order_relaxed);
+  }
+  // Buffers that arrived but were stamped in a *different Link session*, so their beat time
+  // can't be mapped onto ours. Nonzero means audio is reaching us and being thrown away —
+  // a state no latency setting can fix, and one that otherwise looks exactly like silence.
+  uint32_t unmappableCount() const {
+    return mUnmappableCount.load(std::memory_order_relaxed);
+  }
+  // Zero the cumulative dropout count without disturbing the stream, so a count can be read
+  // as "dropouts since I last changed a setting". Just a relaxed store on the same atomic the
+  // receive path increments, so it's safe to call from a control thread while audio runs.
+  void resetDropoutCount() {
+    mDropoutCount.store(0, std::memory_order_relaxed);
+    mUnmappableCount.store(0, std::memory_order_relaxed);
   }
   float jitterMs() const { return mJitterMs.load(std::memory_order_relaxed); }
 
@@ -386,6 +444,9 @@ private:
 
   std::optional<double> moStartReadPos;
   std::atomic<float> mBuffered = 0;
+  // Written only by the render (RT) thread, read by the control thread.
+  std::atomic<bool> mRendering{false};
+  std::atomic<uint32_t> mUnmappableCount{0};
 
   // Health metrics: dropouts (starvation underruns) counted in receive() on the
   // RT thread; jitter updated in onSourceBuffer on the Link thread; both read
@@ -426,7 +487,10 @@ public:
   template <typename ChannelId> void createSource(const ChannelId &) {}
   void removeSource() {}
   float buffered() const { return 0.0f; }
+  bool receiving() const { return false; }
   uint32_t dropoutCount() const { return 0; }
+  uint32_t unmappableCount() const { return 0; }
+  void resetDropoutCount() {}
   float jitterMs() const { return 0.0f; }
 };
 
