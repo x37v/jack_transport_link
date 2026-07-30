@@ -64,7 +64,8 @@ control surfaces below:
 |------|-------------|
 | `-n, --jack-client-name <name>` | JACK client name (metadata subject). Default `jack-transport-link`. |
 | `-N, --link-name <name>` | Link peer name to broadcast; empty uses the hostname. |
-| `-o, --osc-port <port>` | Enable the OSC listener on this UDP port. |
+| `-o, --osc-port <port>` | UDP port for the OSC interface. Default `3234`, searched upwards over 16 ports; an explicit port is used as given. See [Binding the OSC port](#binding-the-osc-port). |
+| `--no-osc` | Disable OSC entirely (enabled by default). **Also disables the Link Audio bridge**, which is OSC-only. |
 | `-c, --config <path>` | Config file path (see [Config File](#config-file)). |
 | `-s / -S` | Enable / disable transport start-stop sync with Link peers. |
 | `--link / --no-link` | Join / don't join the Link session (default: join). |
@@ -78,17 +79,24 @@ CLI flags take precedence over saved config values.
 
 ## Control Interfaces
 
-The service is controlled and observed two ways:
+The service is controlled and observed two ways, split by *how often the value changes*:
 
-1. **JACK metadata** — the primary interface. All keys hang off the base
-   `http://www.x37v.info/jack/metadata/` and target the JACK client (default subject
-   `jack-transport-link`). Writable keys are polled via the property-change callback;
-   read-only keys are published by the service and updated automatically. See the
-   [Metadata Reference](#metadata-reference).
-2. **OSC** — an optional subset, enabled with `-o <port>`. See [OSC Control](#osc-control).
+1. **JACK metadata** — the transport and Link session settings: tempo, sync toggles, peer
+   count. All keys hang off the base `http://www.x37v.info/jack/metadata/` and target the JACK
+   client (default subject `jack-transport-link`). Writable keys are picked up via the
+   property-change callback; read-only keys are published by the service. See the
+   [Metadata Reference](#metadata-reference). You must use jack 1.9.13 or newer for metadata
+   support — JACK transport doesn't let clients request a tempo, which is why tempo lives here.
+2. **OSC** — everything about **Link Audio**, in both directions, plus imperative equivalents of
+   the transport settings. On by default. See [OSC Control](#osc-control).
 
-Since JACK transport doesn't let clients request tempo, tempo (and everything else)
-goes through the metadata API. You must use jack 1.9.13 or newer for metadata support.
+Link Audio is deliberately *not* on metadata. JACK metadata is a disk-backed Berkeley DB and
+every write notifies every connected client whether it cares or not, which is fine for "set the
+tempo occasionally" and wrong for a few-times-a-second stream of receive telemetry. Link Audio
+state is pushed over UDP to clients that have asked for it, and nobody else pays for it.
+
+The one metadata key Link Audio does need is discovery: `osc-port` tells a client which UDP port
+to talk to. Everything from there is OSC.
 
 Example — set / read the tempo:
 
@@ -110,6 +118,8 @@ JACK client subject. **Access** is `R/W` (client may write; service also publish
 applied value) or `R` (read-only, published by the service). Deleting a writable property
 reverts it to its default where noted.
 
+This is the complete list: everything else moved to [OSC](#osc-control).
+
 **Type URIs:** `decimal` = `https://www.w3.org/2001/XMLSchema#decimal`, `integer` =
 `https://www.w3.org/2001/XMLSchema#integer`, `boolean` = `https://www.w3.org/2001/XMLSchema#boolean`,
 `string` = `text/plain`, `JSON` = `application/json`.
@@ -123,58 +133,15 @@ reverts it to its default where noted.
 | `link/start-stop-sync` | boolean | R/W | Synchronize transport start/stop with start-stop-enabled Link peers. |
 | `link/enabled` | boolean | R/W | Master Link on/off. When off, peers don't see this device (tempo sync + Link Audio inactive); JACK transport keeps running locally. Delete → reverts to enabled. |
 | `linkpeers` | integer | R | Number of currently connected Link peers. |
+| `osc-port` | integer | R | The UDP port the OSC interface actually bound. Absent when started with `--no-osc`. This is how a client finds the [OSC interface](#osc-control) — and because JACK removes a client's properties when it disconnects, this key disappearing and reappearing is also how a client learns the service restarted and its listener registration needs renewing. |
 
-### Link Audio — configuration
+### Per-port metadata
 
-| Key | Type | Access | Description |
-|-----|------|--------|-------------|
-| `linkaudio/peer-name` | string | R/W | Link peer display name. Publishes the *effective* name (override or hostname); write to override; delete → reverts to hostname. |
-| `linkaudio/latency` | decimal (ms) | R/W | Receiver playout buffer in ms (converted to beats at the current tempo). Default 100, range 0–2000, non-finite reverts to default. Delete → 100. |
-| `linkaudio/sync-to-incoming` | boolean | R/W | Sync to Incoming Audio: delay the local transport timeline by the buffer so transport-locked generators align with incoming audio. **Default off.** The receive buffer is always applied regardless. Delete → reverts to default (off). |
-
-### Link Audio — sinks and sources (the lists)
-
-Both keys are **declarative**: write the list you want and the service reconciles it (add,
-remove, rename, reorder in one idempotent pass), then publishes the canonical applied value —
-key-tagged, in display order — back to the same key. Diff your desired list against that
-read-back. Deleting either key reverts it to the empty list (all slots removed).
-
-| Key | Type | Access | Value |
-|-----|------|--------|-------|
-| `linkaudio/sinks` | JSON | R/W | `[{"key":"a3f2c19b4e0d","name":"Drums"}, …]` in display order. On write, `key` is optional: an entry with only a `name` is self-keying (the key is derived from the name), and an entry with an existing slot's `key` plus a different `name` is a **rename**. |
-| `linkaudio/sources` | JSON | R/W | `[{"key":"7b10c9de2245","peer":"Alex's Move","channel":"Cue"}, …]` in display order. On write, an entry with a `channel` is matched by exact `peer`+`channel`; an entry with only a `key` refers to an existing slot (this is what an order-only write looks like). |
-
-Rejected entries (empty or duplicate sink name, duplicate source, slot-key collision,
-unparseable JSON) are skipped, the rest of the list is applied, and the canonical value is
-republished so a client's read-back self-corrects. A rejected *rename* keeps its slot under the
-previous name — removal is only ever expressed by omitting an entry.
-
-### Link Audio — commands (write-only)
-
-| Key | Type | Access | Description |
-|-----|------|--------|-------------|
-| `linkaudio/reset-dropouts` | string | W | Zero a source's cumulative dropout count so it reads as "dropouts since now" — useful for A/B'ing a latency or buffer change. Value is a slot `key`, or `*` for every source. The service **removes the property** once it has acted, which is also what lets the same value be sent twice in a row. |
-
-### Link Audio — status (read-only)
-
-| Key | Type | Access | Description |
-|-----|------|--------|-------------|
-| `linkaudio/channels` | JSON | R | Available channels grouped by peer: `[{"peer":…,"channels":[…]}, …]`. |
-| `linkaudio/source-status` | JSON | R | Per-source live receive telemetry, key-tagged and in display order: `[{"key":…,"connected":…,"receiving":…,"buffered_ms":…,"dropouts":…,"arrival_offset_ms":…,"jitter_ms":…}, …]`. Updated a few times per second, and immediately on a connect/disconnect. The configured identity is in `linkaudio/sources`; because it is matched exactly, the resolved channel is either identical to it or absent, which is what `connected` reports. `receiving` is true while blocks are actually being filled with audio — see [Reading the telemetry](#reading-the-telemetry). |
-
-### Link Audio — latency (read-only)
-
-The service auto-detects device I/O latency via JACK's latency callback and compensates
-send/receive timing. These are observation-only; adjust the trim via the
-`--capture-latency-trim-ms` / `--playback-latency-trim-ms` CLI flags (or config), **not**
-via metadata.
-
-| Key | Type | Access | Description |
-|-----|------|--------|-------------|
-| `linkaudio/capture-latency` | decimal (ms) | R | Effective send latency (auto-detected + trim). |
-| `linkaudio/playback-latency` | decimal (ms) | R | Effective receive latency (auto-detected + trim). |
-| `linkaudio/capture-latency-auto` | decimal (ms) | R | JACK auto-detected capture latency. |
-| `linkaudio/playback-latency-auto` | decimal (ms) | R | JACK auto-detected playback latency. |
+The service also sets JACK's three standard presentation keys on its own Link Audio audio ports,
+subject = the *port* UUID rather than the client: `port-group` (`jack-link-audio`),
+`pretty-name` (a sink's name, or a source's `"<peer>: <channel>"`, suffixed `" L"` / `" R"`) and
+`order` (following the display order). They live here rather than on OSC precisely because a
+generic patchbay finds them by looking up the port it is already drawing.
 
 ## Link Audio
 
@@ -190,11 +157,12 @@ you add a sink by naming it, and a source by picking a specific advertised peer/
 * A **source** subscribes to one exact advertised `(peer, channel)` and writes it to the JACK
   output port pair `out_<key>_l` / `out_<key>_r`.
 
-The receiver buffers incoming audio by `linkaudio/latency` ms (always applied — network
-buffers arrive late). "Sync to Incoming Audio" (`linkaudio/sync-to-incoming`, default off)
-additionally delays the *local* transport timeline by that buffer so transport-locked
-generators stay phase-aligned with the incoming stream; when off, the local transport runs
-live and incoming audio simply lags local generators by the buffer.
+All of this is driven over [OSC](#osc-control) — commands in, state pushed back out.
+
+The receiver buffers incoming audio by `latency` ms (always applied — network buffers arrive
+late). "Sync to Incoming Audio" (default off) additionally delays the *local* transport timeline
+by that buffer so transport-locked generators stay phase-aligned with the incoming stream; when
+off, the local transport runs live and incoming audio simply lags local generators by the buffer.
 
 ### Slot keys and port names
 
@@ -228,51 +196,37 @@ display order, so patchbays show and sort them sensibly.
 
 ```shell
 # Two sinks, in display order
-jack_property --client jack-transport-link \
-  http://www.x37v.info/jack/metadata/linkaudio/sinks \
-  '[{"name":"Drums"},{"name":"Bass"}]' application/json
+oscsend localhost 3234 /jacklink/audio/sink/add s Drums
+oscsend localhost 3234 /jacklink/audio/sink/add s Bass
 
-# Read back the canonical value (now key-tagged)
-jack_property --client jack-transport-link --list \
-  http://www.x37v.info/jack/metadata/linkaudio/sinks
-
-# ... and the ports it registered, with their pretty names
+# The ports it registered, with their pretty names
 jack_lsp -A jack-transport-link
 
-# Rename "Drums" to "Kit": same key, new name (live connections follow the new ports)
-jack_property --client jack-transport-link \
-  http://www.x37v.info/jack/metadata/linkaudio/sinks \
-  '[{"key":"b42f444b799a","name":"Kit"},{"name":"Bass"}]' application/json
+# Rename "Drums" to "Kit" (live connections follow the new ports)
+oscsend localhost 3234 /jacklink/audio/sink/rename ss Drums Kit
 
 # Reorder (order metadata only — no ports re-registered, no connections moved)
-jack_property --client jack-transport-link \
-  http://www.x37v.info/jack/metadata/linkaudio/sinks \
-  '[{"name":"Bass"},{"name":"Kit"}]' application/json
+oscsend localhost 3234 /jacklink/audio/sinks/order ss Bass Kit
 
-# Remove everything
-jack_property --client jack-transport-link \
-  http://www.x37v.info/jack/metadata/linkaudio/sinks '[]' application/json
+# Remove one
+oscsend localhost 3234 /jacklink/audio/sink/remove s Kit
 ```
+
+The applied list comes back on `/jacklink/state/audio/sinks`, key-tagged and in display order —
+register a listener (see [OSC Control](#osc-control)) and diff against that.
 
 ### Adding and removing sources
 
 A source names an exact peer and channel — matching is exact and case-sensitive, and there is
-no auto-selection. List what's advertised with `linkaudio/channels`, then add what you want:
+no auto-selection. `/jacklink/state/audio/channels` lists what's advertised; add what you want:
 
 ```shell
-# List available channels
-jack_property --client jack-transport-link --list \
-  http://www.x37v.info/jack/metadata/linkaudio/channels
-
-# Subscribe to two of them
-jack_property --client jack-transport-link \
-  http://www.x37v.info/jack/metadata/linkaudio/sources \
-  '[{"peer":"Push","channel":"Master"},{"peer":"Alex","channel":"Cue"}]' application/json
-
-# Live receive telemetry, joined to the list above by key
-jack_property --client jack-transport-link --list \
-  http://www.x37v.info/jack/metadata/linkaudio/source-status
+oscsend localhost 3234 /jacklink/audio/source/add ss Push Master
+oscsend localhost 3234 /jacklink/audio/source/add ss Alex Cue
 ```
+
+Live receive telemetry arrives on `/jacklink/state/audio/source-status`, joined to
+`/jacklink/state/audio/sources` by key.
 
 If a source's peer goes offline the entry **stays in the list**, marked disconnected, keeps its
 ports, and reconnects by itself when a channel with the same peer and channel name reappears.
@@ -280,7 +234,7 @@ A peer appearing that no source names connects to nothing.
 
 ### Reading the telemetry
 
-`source-status` reports two separate booleans, and the difference matters:
+`/jacklink/state/audio/source-status` reports two separate booleans, and the difference matters:
 
 | | meaning |
 |---|---|
@@ -296,7 +250,7 @@ code — `endBeats()` returns `std::optional<double>`, and comparing it directly
 is a trap, because `nullopt < v` is defined as **true** for every `v`, so a foreign-session buffer
 looks "too old" and gets discarded at any buffer size. A sender stamps each
 buffer with the beat it captured and then transmits it, so a buffer inevitably *arrives* after the
-beat it carries. `linkaudio/latency` is what lets the receiver aim its playout cursor far enough
+beat it carries. `latency` is what lets the receiver aim its playout cursor far enough
 behind the live beat for the audio to have shown up. Set it to `0` and the cursor sits on the live
 beat, every queued buffer is already too old, and the source outputs silence forever.
 
@@ -324,7 +278,7 @@ evidence of a miscalculated buffer — it means the arrival offset really is tha
 
   - the sender's own buffer/period size (a sender emitting long chunks cannot be received with a
     short playout buffer);
-  - `linkaudio/playback-latency` and `linkaudio/playback-latency-auto`. The receive target is
+  - the pushed `playback-latency` and `playback-latency-auto`. The receive target is
     `beat(now + playback-latency) - latency`, so an over-reported playback latency pushes the
     playout cursor into the future and has to be paid for with extra `latency`. These are
     read-only; correct them with `--playback-latency-trim-ms` (a negative trim is allowed).
@@ -336,22 +290,103 @@ been changing settings. Zero it to measure from now:
 
 ```shell
 # every source
-jack_property --client jack-transport-link \
-  http://www.x37v.info/jack/metadata/linkaudio/reset-dropouts '*' text/plain
+oscsend localhost 3234 /jacklink/audio/source/reset-dropouts
 
 # one source, by slot key
-oscsend localhost 4001 /jacklink/audio/source/reset-dropouts s 7b10c9de2245
+oscsend localhost 3234 /jacklink/audio/source/reset-dropouts s 7b10c9de2245
 # ... or by identity
-oscsend localhost 4001 /jacklink/audio/source/reset-dropouts ss "Alex's Move" Cue
+oscsend localhost 3234 /jacklink/audio/source/reset-dropouts ss "Alex's Move" Cue
 ```
 
-Resetting does not disturb the stream, and `source-status` is republished immediately rather than
-at the next telemetry tick, so the zero shows up at once.
+Resetting does not disturb the stream, and `source-status` is re-sent immediately rather than at
+the next telemetry tick, so the zero shows up at once.
 
 ## OSC Control
 
-Pass `-o <port>` to enable the OSC listener. It covers a subset of the metadata controls;
-anything not listed here is metadata-only.
+OSC is on by default. It is the whole Link Audio interface, in both directions, and also offers
+imperative equivalents of the transport/Link settings that live in metadata.
+
+### Binding the OSC port
+
+With no `-o`, the service binds the first free port in `3234`–`3249` and publishes the one it got
+as the `osc-port` metadata key. With an explicit `-o <port>` it makes exactly one attempt.
+
+Every failure is **fatal** — a jack_transport_link with no OSC socket has no Link Audio bridge at
+all, and on a headless device a unit that failed to start is far easier to diagnose than one that
+came up quietly half-working. That covers an explicit port already in use, the whole default range
+being busy, and a port outside `1`–`65535`. In particular `-o 0` is an *error*, not "off": port 0
+conventionally means "let the OS pick an ephemeral port", and that meaning is worth keeping free.
+
+To actually turn OSC off, use `--no-osc`. Nothing binds, no `osc-port` key is published, and a
+client that finds no key correctly reports Link Audio unavailable. The service still runs as JACK
+transport master and Link peer, and the metadata keys still work.
+
+The port is deliberately **not** persisted to the config file: it's discovery-published, and a
+config-supplied value would raise an unanswerable question about whether it counts as explicit
+(fail on conflict) or default (search the range).
+
+### Registering for state
+
+State is *pushed*, only to clients that ask, so an idle device with nobody watching sends nothing
+at all. Register with the port you want it sent to:
+
+| Address | Args | Behaviour |
+|---------|------|-----------|
+| `/jacklink/listeners/add` | `s "[ip:]port"` *or* `i port` | Register. A bare port implies `127.0.0.1`. Always answered with a **full snapshot of every state address**, even if that endpoint was already registered. |
+| `/jacklink/listeners/del` | `s "[ip:]port"` *or* `i port` | Unregister. Silent if not present. |
+| `/jacklink/listeners/clear` | *(none)* | Unregister everything. |
+
+The snapshot goes to the endpoint named in the payload, **not** to the datagram's source — a
+client generally sends from an ephemeral port and listens on a declared one. A port outside
+`1`–`65535`, an unresolvable address, or our own receive port on loopback is rejected.
+
+Snapshotting even a duplicate registration is the point, not sloppiness: if the *client* restarts
+while the service doesn't, its registration is still here, so ignoring the duplicate would send
+nothing and leave the client blank until something happened to change.
+
+Registrations are **ephemeral** — in memory only, never written to the config file or any
+database, and gone when the service exits. Re-register on startup, and re-register when the
+`osc-port` key reappears. Sending the same `add` periodically is a reasonable heartbeat; it's
+idempotent.
+
+### State push
+
+Sent to every registered listener, one message per datagram (the JSON payloads are easily
+multi-KB, which makes a bundle a bad idea). Booleans are OSC `T`/`F`.
+
+| Address | Args | Description |
+|---------|------|-------------|
+| `/jacklink/state/audio/available` | `bool` | Whether Link Audio is enabled at all (false with `-A`). Explicit, because with no metadata key to be missing there's nothing else to infer it from. |
+| `/jacklink/state/audio/channels` | `s` JSON | Available channels grouped by peer: `[{"peer":…,"channels":[…]}, …]`. |
+| `/jacklink/state/audio/peer-name` | `s` | The *effective* Link peer name being broadcast (override or hostname). |
+| `/jacklink/state/audio/latency` | `f` ms | Applied receiver playout buffer. |
+| `/jacklink/state/audio/sync-to-incoming` | `bool` | Applied Sync to Incoming Audio toggle. |
+| `/jacklink/state/audio/sinks` | `s` JSON | `[{"key":"a3f2c19b4e0d","name":"Drums"}, …]` in display order. |
+| `/jacklink/state/audio/sources` | `s` JSON | `[{"key":"7b10c9de2245","peer":"Alex's Move","channel":"Cue"}, …]` in display order. |
+| `/jacklink/state/audio/source-status` | `s` JSON | Per-source live receive telemetry, key-tagged and in display order: `[{"key":…,"connected":…,"receiving":…,"buffered_ms":…,"dropouts":…,"arrival_offset_ms":…,"jitter_ms":…}, …]`. A few times per second, and immediately on a connect/disconnect. See [Reading the telemetry](#reading-the-telemetry). |
+| `/jacklink/state/audio/capture-latency` | `f` ms | Effective send latency (auto-detected + trim). |
+| `/jacklink/state/audio/playback-latency` | `f` ms | Effective receive latency (auto-detected + trim). |
+| `/jacklink/state/audio/capture-latency-auto` | `f` ms | JACK auto-detected capture latency. |
+| `/jacklink/state/audio/playback-latency-auto` | `f` ms | JACK auto-detected playback latency. |
+
+The four JSON blobs stay whole strings on purpose. Each is a self-healing snapshot of its own
+topic, and `sinks`/`sources` are the authority for **both** the slot set and the display order,
+with telemetry joined to them by `key` — flattening them into per-slot addresses would throw that
+atomicity away.
+
+`/jacklink/state/...` is deliberately a different namespace from the `/jacklink/...` command
+addresses the service accepts, so state can never be mistaken for a command in either direction.
+
+Traffic is kept down three ways: nothing is built at all with no listeners registered; a payload
+identical to the last one sent is skipped; and the noisy measured floats are quantized to 0.1 ms
+before that comparison, so wobble can't defeat it. With every source disconnected the telemetry
+payload is a constant all-zero array and the stream stops entirely. Against that, the whole state
+is re-sent every ~2 s, so a dropped datagram can't leave a listener stale indefinitely.
+
+The latency values are observation-only; adjust them with the `--capture-latency-trim-ms` /
+`--playback-latency-trim-ms` CLI flags (or config), not over the wire.
+
+### Commands
 
 | Address | Argument | Description |
 |---------|----------|-------------|
@@ -373,9 +408,15 @@ anything not listed here is metadata-only.
 | `/jacklink/audio/source/reset-dropouts` | *(none)*, `string key`, *or* `string peer, string channel` | Zero the dropout count — of every source with no arguments, otherwise of the one named. |
 | `/jacklink/audio/sources/order` | `string …` | Set the display order by key. Omitted slots keep their relative order at the end. |
 
-These are imperative sugar over the two declarative list properties — whole-array JSON is
-painful to send over OSC. Each command mutates the desired list and lets the same reconcile pass
-apply it, so the rejection rules are identical.
+Every command is *imperative and identity-based*: it names what to change rather than restating the
+whole list, so a client never has to read-modify-write, and two clients issuing different commands
+can't clobber each other. Each one stages a change to the desired list and lets a single idempotent
+reconcile pass apply it, which is where all the validation lives.
+
+Rejected entries (empty or duplicate sink name, duplicate source, slot-key collision) are skipped
+and the rest is applied; the resulting canonical lists are pushed on
+`/jacklink/state/audio/{sinks,sources}`, so a client's view self-corrects. A rejected *rename*
+keeps its slot under the previous name — removal is only ever expressed by omitting an entry.
 
 Note that the identifier is an *argument*, not part of the address: a sink name can contain a
 `/`, which an OSC address can't encode.
@@ -387,6 +428,11 @@ Note that the identifier is an *argument*, not part of the address: a sink name 
 # /jacklink/audio/source/add     "Alex's Move" "Cue"
 # /jacklink/audio/source/remove  "Alex's Move" "Cue"
 ```
+
+**No delete-reverts-to-default.** The old metadata keys had one: removing `linkaudio/latency`
+snapped it back to 100 ms, removing `linkaudio/peer-name` reverted to the hostname, removing
+either list emptied it. OSC has no analogue of "unset a value" and that behaviour is simply gone —
+set the default explicitly instead (an empty `peer-name` string still means "use the hostname").
 
 ## Config File
 
