@@ -534,6 +534,9 @@ void JackTransportLink::processEventsLocked() {
     std::swap(pending, mPendingOscSnapshots);
     for (const auto &endpoint : pending)
       sendOscSnapshot(endpoint);
+    // Restart the re-publish timer: it stops advancing while nobody is listening, so a first
+    // registration would otherwise be immediately followed by a re-publish of what it just got.
+    mLastOscRepublish = std::chrono::steady_clock::now();
   }
   // Counterweight to the change guards: re-send the low-rate state periodically so a lost datagram
   // can't leave a listener stale indefinitely. A few hundred bytes every couple of seconds.
