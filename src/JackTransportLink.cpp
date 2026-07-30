@@ -1273,6 +1273,9 @@ void JackTransportLink::setLinkAudioSourceStatusProperty() {
         // nonzero = audio is arriving but stamped in a different Link session, so it can't be
         // placed on our beat timeline and is discarded. No latency value helps.
         {"unmappable",  s.renderer ? s.renderer->unmappableCount() : 0u},
+        // measured: how far behind the live beat the newest arrived audio begins. The playout
+        // buffer has to exceed this, so it is what a too-small `latency` should be compared to.
+        {"arrival_offset_ms", s.renderer ? s.renderer->arrivalOffsetMs() : 0.0f},
         {"jitter_ms",   s.renderer ? s.renderer->jitterMs() : 0.0f},
     });
   }

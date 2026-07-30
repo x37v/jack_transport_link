@@ -160,7 +160,7 @@ previous name — removal is only ever expressed by omitting an entry.
 | Key | Type | Access | Description |
 |-----|------|--------|-------------|
 | `linkaudio/channels` | JSON | R | Available channels grouped by peer: `[{"peer":…,"channels":[…]}, …]`. |
-| `linkaudio/source-status` | JSON | R | Per-source live receive telemetry, key-tagged and in display order: `[{"key":…,"connected":…,"receiving":…,"buffered_ms":…,"dropouts":…,"unmappable":…,"jitter_ms":…}, …]`. Updated a few times per second, and immediately on a connect/disconnect. The configured identity is in `linkaudio/sources`; because it is matched exactly, the resolved channel is either identical to it or absent, which is what `connected` reports. `receiving` is true while blocks are actually being filled with audio — see [Reading the telemetry](#reading-the-telemetry). |
+| `linkaudio/source-status` | JSON | R | Per-source live receive telemetry, key-tagged and in display order: `[{"key":…,"connected":…,"receiving":…,"buffered_ms":…,"dropouts":…,"unmappable":…,"arrival_offset_ms":…,"jitter_ms":…}, …]`. Updated a few times per second, and immediately on a connect/disconnect. The configured identity is in `linkaudio/sources`; because it is matched exactly, the resolved channel is either identical to it or absent, which is what `connected` reports. `receiving` is true while blocks are actually being filled with audio — see [Reading the telemetry](#reading-the-telemetry). |
 
 ### Link Audio — latency (read-only)
 
@@ -309,8 +309,28 @@ starts therefore reports `0` dropouts while producing nothing, which is exactly 
 exists. (Related: because each starve resets the read position, a sustained outage counts as one
 dropout rather than one per block.)
 
-There's no universal minimum for `latency`; it has to cover the sender's buffer size plus network
-jitter. Raise it until `receiving` goes true and `dropouts` stops advancing.
+#### How much `latency` a source needs
+
+`arrival_offset_ms` measures it directly: the delay between the live beat and the beat the newest
+arrived buffer *begins* at. A sender stamps a buffer with the beat it captured and can only
+transmit it once it's full, so the freshest audio you hold is always that far in the past.
+`latency` has to exceed `arrival_offset_ms` for anything to play at all, and exceed it by the
+jitter margin for playback to stay clean.
+
+The two readings move together: in steady state
+
+    buffered_ms  ~=  latency  -  arrival_offset_ms
+
+so a source that only plays at a large `latency` while reporting a small `buffered_ms` is not
+evidence of a miscalculated buffer — it means the arrival offset really is that large, and
+`arrival_offset_ms` is where to look for why. Compare it against:
+
+  - the sender's own buffer/period size (a sender emitting long chunks cannot be received with a
+    short playout buffer);
+  - `linkaudio/playback-latency` and `linkaudio/playback-latency-auto`. The receive target is
+    `beat(now + playback-latency) - latency`, so an over-reported playback latency pushes the
+    playout cursor into the future and has to be paid for with extra `latency`. These are
+    read-only; correct them with `--playback-latency-trim-ms` (a negative trim is allowed).
 
 ### Resetting dropout counts
 

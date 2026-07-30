@@ -125,6 +125,25 @@ public:
     // opposed to normal pre-roll silence.
     const bool wasRendering = moStartReadPos.has_value();
 
+    // How far behind the live beat the freshest audio we hold begins, in ms. This is the
+    // number the playout buffer has to cover: the sender stamps a buffer with the beat it
+    // captured and only transmits it once full, so the newest arrival is always in the past.
+    // Measuring it (rather than inferring it from "what latency finally worked") is what
+    // separates a real arrival delay from a mis-computed playout cursor, since
+    // buffered ~= latency - arrivalOffset holds either way.
+    if (mpQueueReader->numRetainedSlots() > 0) {
+      const auto &newest =
+          (*mpQueueReader)[mpQueueReader->numRetainedSlots() - 1]->mInfo;
+      const auto newestBegin = newest.beginBeats(sessionState, quantum);
+      const auto liveBeat = sessionState.beatAtTime(hostTime, quantum);
+      const auto bps = sessionState.tempo() / 60.0;
+      if (newestBegin && bps > 0.0) {
+        mArrivalOffsetMs.store(
+            static_cast<float>(1000.0 * (liveBeat - *newestBegin) / bps),
+            std::memory_order_relaxed);
+      }
+    }
+
     // Playout buffer expressed in milliseconds, converted to beats at the
     // current tempo — the same scheme Ableton Live and Max use (latency_beats =
     // (ms/1000) * (bpm/60)). Expressing it in ms keeps the real-time buffer
@@ -374,6 +393,7 @@ public:
       mJitterMs.store(0.0f, std::memory_order_relaxed);
       mDropoutCount.store(0, std::memory_order_relaxed);
       mUnmappableCount.store(0, std::memory_order_relaxed);
+      mArrivalOffsetMs.store(0.0f, std::memory_order_relaxed);
       mBuffered.store(0.0f, std::memory_order_relaxed);
       mRendering.store(false, std::memory_order_relaxed);
     }
@@ -393,6 +413,12 @@ public:
   // a state no latency setting can fix, and one that otherwise looks exactly like silence.
   uint32_t unmappableCount() const {
     return mUnmappableCount.load(std::memory_order_relaxed);
+  }
+  // Measured delay between the live beat and the beat the newest arrived buffer begins at.
+  // The playout buffer (latencyMs) has to exceed this for anything to play, so it is the
+  // number to compare a "why do I need so much latency?" against.
+  float arrivalOffsetMs() const {
+    return mArrivalOffsetMs.load(std::memory_order_relaxed);
   }
   // Zero the cumulative dropout count without disturbing the stream, so a count can be read
   // as "dropouts since I last changed a setting". Just a relaxed store on the same atomic the
@@ -447,6 +473,7 @@ private:
   // Written only by the render (RT) thread, read by the control thread.
   std::atomic<bool> mRendering{false};
   std::atomic<uint32_t> mUnmappableCount{0};
+  std::atomic<float> mArrivalOffsetMs{0.0f};
 
   // Health metrics: dropouts (starvation underruns) counted in receive() on the
   // RT thread; jitter updated in onSourceBuffer on the Link thread; both read
@@ -490,6 +517,7 @@ public:
   bool receiving() const { return false; }
   uint32_t dropoutCount() const { return 0; }
   uint32_t unmappableCount() const { return 0; }
+  float arrivalOffsetMs() const { return 0.0f; }
   void resetDropoutCount() {}
   float jitterMs() const { return 0.0f; }
 };
