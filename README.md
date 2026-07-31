@@ -249,10 +249,12 @@ the buffer has to be discarded, which looks the same from the outside. Beware wh
 code — `endBeats()` returns `std::optional<double>`, and comparing it directly against a `double`
 is a trap, because `nullopt < v` is defined as **true** for every `v`, so a foreign-session buffer
 looks "too old" and gets discarded at any buffer size. A sender stamps each
-buffer with the beat it captured and then transmits it, so a buffer inevitably *arrives* after the
-beat it carries. `latency` is what lets the receiver aim its playout cursor far enough
-behind the live beat for the audio to have shown up. Set it to `0` and the cursor sits on the live
-beat, every queued buffer is already too old, and the source outputs silence forever.
+buffer with the beat it captured and only transmits it once it's full, so a buffer normally *arrives*
+after the beat it carries (not always — see
+[When `arrival_offset_ms` is negative](#when-arrival_offset_ms-is-negative)). `latency` is what lets
+the receiver aim its playout cursor far enough behind the live beat for the audio to have shown up.
+Set it to `0` and the cursor sits on the live beat, every queued buffer is already too old, and the
+source outputs silence forever.
 
 **`dropouts` cannot tell you this.** A dropout is only counted once playback has established a
 read position — silence before that is indistinguishable from normal pre-roll. A source that never
@@ -262,17 +264,22 @@ dropout rather than one per block.)
 
 #### How much `latency` a source needs
 
-`arrival_offset_ms` measures it directly: the delay between the live beat and the beat the newest
-arrived buffer *begins* at. A sender stamps a buffer with the beat it captured and can only
-transmit it once it's full, so the freshest audio you hold is always that far in the past.
-`latency` has to exceed `arrival_offset_ms` for anything to play at all, and exceed it by the
-jitter margin for playback to stay clean.
+`arrival_offset_ms` measures it directly: the gap between the beat this block will be *heard* at and
+the beat the newest buffer we hold *begins* at. "Heard at" rather than "now" because the receive path
+works from `mTimeNext + playback-latency` — which matters for the negative case below.
+
+A sender stamps a buffer with the beat it captured and can only transmit it once it's full, so the
+freshest audio you hold is normally in the past and the reading is **positive**. `latency` has to
+exceed it for anything to play at all, and exceed it by the jitter margin for playback to stay clean.
 
 The two readings move together: in steady state
 
     buffered_ms  ~=  latency  -  arrival_offset_ms
 
-so a source that only plays at a large `latency` while reporting a small `buffered_ms` is not
+approximately — the offset is sampled at the top of a render pass and `buffered_ms` at the bottom, so
+expect a few ms of disagreement, on the order of the jitter.
+
+So a source that only plays at a large `latency` while reporting a small `buffered_ms` is not
 evidence of a miscalculated buffer — it means the arrival offset really is that large, and
 `arrival_offset_ms` is where to look for why. Compare it against:
 
@@ -282,6 +289,38 @@ evidence of a miscalculated buffer — it means the arrival offset really is tha
     `beat(now + playback-latency) - latency`, so an over-reported playback latency pushes the
     playout cursor into the future and has to be paid for with extra `latency`. These are
     read-only; correct them with `--playback-latency-trim-ms` (a negative trim is allowed).
+
+#### When `arrival_offset_ms` is negative
+
+This is normal, and against a DAW it is the *common* case. A negative reading means the newest audio
+you hold is stamped for a beat **later** than your playout moment: the sender is running ahead of you
+on the shared beat timeline, so audio is arriving before it is needed rather than late.
+
+What pushes it negative is the sender, not you: **a DAW renders ahead of its own output.** At
+wall-clock now it has already produced the audio its driver will play out one output-latency from now,
+and it stamps buffers with the beat that audio belongs to. Ableton Live is routinely some milliseconds
+ahead for this reason alone.
+
+Note which way your own `playback-latency` moves the reading — it is easy to get backwards. The offset
+is measured against `beat(mTimeNext + playback-latency)`, so a larger playback latency puts the
+reference point *later* and pushes the reading **positive**. A device with real output latency
+therefore reports a *less* negative offset than one whose driver reports none, and a still-negative
+reading on real hardware means the sender is ahead by more than your own output latency accounts for.
+
+The consequence catches people out: **`buffered_ms` comes out larger than the `latency` you set**,
+because `latency - arrival_offset_ms` exceeds `latency` once the offset goes negative. Nothing is
+wrong and it is not a buffer overrun — it is cushion the sender handed you for free.
+
+It also means you are probably buffering more than you need, since what `latency` has to cover is the
+*positive* arrival delay plus a jitter margin. Two cautions before you cut it:
+
+  - size it against the **worst** offset you observe, not the instantaneous one — it moves with
+    network conditions and with the sender's own buffer settings;
+  - step down while watching `dropouts` and `receiving`. The failure mode is the opposite sign: a
+    large positive offset with `latency` below it gives `receiving: false` and silence.
+
+Worth a glance that `buffered_ms` is *stable* rather than climbing. Steady near
+`latency - arrival_offset_ms` is correct; growing without bound would mean the queue isn't draining.
 
 ### Resetting dropout counts
 
