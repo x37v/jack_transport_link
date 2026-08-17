@@ -45,13 +45,19 @@ const std::string
 // sync, no Link Audio); jtl still runs as the local JACK transport master.
 const std::string
     link_enabled_key("http://www.x37v.info/jack/metadata/link/enabled");
+// Set on each of our Link Audio ports, carrying that port's slot key. Its *presence* is what
+// marks a port as ours (the port group is a display string and can't be relied on for that);
+// its value joins the port back to the slot's OSCQuery node under sources/list or sinks/list.
+// Which of the two lists to look in comes from the port direction: a sink is a JACK input, a
+// source a JACK output — needed, because sink and source keys are separate hash namespaces.
+const std::string
+    link_audio_slot_key("http://www.x37v.info/jack/metadata/link/audio/slot");
 const char *string_type = "text/plain";
 // JACK's standard port presentation metadata (grouping + display name), set on our own
 // audio ports so patchbays (e.g. the RNBO runner's graph editor) group and label them.
 const std::string port_group_key(JACK_METADATA_PORT_GROUP);
 const std::string pretty_name_key(JACK_METADATA_PRETTY_NAME);
 const std::string order_key(JACK_METADATA_ORDER);
-const char *link_audio_port_group = "jack-link-audio";
 // JACK recommends this type for the order key; it also matches what the RNBO runner parses.
 const char *order_type = "http://www.w3.org/2001/XMLSchema#int";
 const std::array<std::string, 2> true_values = {"true", "1"};
@@ -1428,12 +1434,13 @@ void JackTransportLink::applyLinkPeerName() {
   sendLinkAudioPeerName();
 }
 
-// Set the port-group + pretty-name on our own audio ports so patchbays present them as a
-// "jack-link-audio" node. The port *names* are hash-derived (in_<key>_l), which is what makes
-// them stable per identity; the pretty name is what a UI shows: a sink's announced name, a
-// source's "<peer>: <channel>". Iterates the display-order vectors so ORDER follows the user's
-// arrangement. Only writes on change to avoid notification churn; JACK removes this metadata
-// automatically when the ports are unregistered.
+// Decorate our own audio ports for patchbays: a port group per identity (all sinks together,
+// one node per source peer), a pretty name (the sink's announced name, or the source's channel),
+// and the slot key, which is how a client joins a port back to its OSCQuery slot node. The port
+// *names* are hash-derived (in_<key>_l), which is what makes them stable per identity.
+// Iterates the display-order vectors so ORDER follows the user's arrangement. Only writes on
+// change to avoid notification churn; JACK removes this metadata automatically when the ports
+// are unregistered.
 void JackTransportLink::updateAudioPortMetadata() {
   if (!mLinkAudioEnabled) return;
   auto setIfChanged = [this](jack_port_t* port, const std::string& key, const std::string& val, const char* type) {
@@ -1444,29 +1451,32 @@ void JackTransportLink::updateAudioPortMetadata() {
     if (!(get_property(u, key, cur, t) && cur == val))
       jack_set_property(mJackClient, u, key.c_str(), val.c_str(), type);
   };
-  auto decorate = [&](jack_port_t* port, const std::string& pretty, int order) {
-    setIfChanged(port, port_group_key, link_audio_port_group, string_type);
+  auto decorate = [&](jack_port_t* port, const std::string& group, const std::string pretty,
+                      const std::string& slot, int order) {
+    setIfChanged(port, port_group_key, group, string_type);
     setIfChanged(port, pretty_name_key, pretty, string_type);
     setIfChanged(port, order_key, std::to_string(order), order_type);
+    setIfChanged(port, link_audio_slot_key, slot, string_type);
   };
   int pos = 0;
-  for (const auto& key : mSinkOrder) {
-    const size_t i = findSinkByKey(key);
-    if (i == std::string::npos) continue;
-    decorate(mSinks[i].portL, mSinks[i].name + " L", 2 * pos + 1);
-    decorate(mSinks[i].portR, mSinks[i].name + " R", 2 * pos + 2);
-    ++pos;
+  {
+    const std::string group("Link: Sends");
+    for (const auto& key : mSinkOrder) {
+      const size_t i = findSinkByKey(key);
+      if (i == std::string::npos) continue;
+      decorate(mSinks[i].portL, group, mSinks[i].name + " L", key, 2 * pos + 1);
+      decorate(mSinks[i].portR, group, mSinks[i].name + " R", key, 2 * pos + 2);
+      ++pos;
+    }
   }
   pos = 0;
   for (const auto& key : mSourceOrder) {
     const size_t i = findSource(key);
     if (i == std::string::npos) continue;
     const auto& s = mSources[i];
-    // fall back to the raw channel (or peer) when the other field is empty
-    const std::string base = (s.peer.size() && s.channel.size())
-        ? s.peer + ": " + s.channel : s.peer + s.channel;
-    decorate(s.portL, base + " L", 2 * pos + 1);
-    decorate(s.portR, base + " R", 2 * pos + 2);
+    const std::string group = "Link: " + s.peer;
+    decorate(s.portL, group, s.channel + " L", key, 2 * pos + 1);
+    decorate(s.portR, group, s.channel + " R", key, 2 * pos + 2);
     ++pos;
   }
 }
