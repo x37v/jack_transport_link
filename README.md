@@ -232,6 +232,39 @@ If a source's peer goes offline the entry **stays in the list**, marked disconne
 ports, and reconnects by itself when a channel with the same peer and channel name reappears.
 A peer appearing that no source names connects to nothing.
 
+### Replacing the whole list
+
+`sinks/set` and `sources/set` state the desired list outright instead of naming one change:
+whatever isn't listed is removed, and the argument order is the display order.
+
+```shell
+# Exactly these two sinks, in this order — anything else we hold goes away
+oscsend localhost 3234 /jacklink/audio/sinks/set ss Drums Bass
+
+# Exactly this one source
+oscsend localhost 3234 /jacklink/audio/sources/set ss Push Master
+
+# No arguments = remove all
+oscsend localhost 3234 /jacklink/audio/sinks/set
+```
+
+This exists for restoring a saved arrangement. Doing it with `add`/`remove` costs one reconcile
+pass per command, and each structural pass cycles `jack_deactivate`/`jack_activate`; one `set`
+applies the whole arrangement in a single pass, so ports appear once and connections settle once.
+
+Two consequences of it being a *list of identities* rather than a list of edits:
+
+- A rename isn't expressible. A sink's key — and therefore its JACK port names — derives from its
+  name, so replacing `Drums` with `Kit` reads as a remove plus an add, and connections to the old
+  ports don't follow. Use `sink/rename` when you mean rename.
+- The message is all-or-nothing. A malformed list (a non-string, an unpaired peer, an empty name
+  or channel) is rejected whole and logged, because applying the readable part of it would delete
+  the slots that came after the bad entry. This is stricter than the imperative commands, where a
+  rejected entry is skipped and the rest applied.
+
+The applied lists come back on `/jacklink/state/audio/{sinks,sources}` as usual — a client that
+just wrote a `set` can diff against those to see what landed.
+
 ### Reading the telemetry
 
 `/jacklink/state/audio/source-status` reports two separate booleans, and the difference matters:
@@ -442,15 +475,20 @@ The latency values are observation-only; adjust them with the `--capture-latency
 | `/jacklink/audio/sink/remove` | `string name\|key` | Remove that sink (tried as a name first, then as a key). |
 | `/jacklink/audio/sink/rename` | `string old, string new` | Rename a sink (identified by name or key). Rejected on a name collision. |
 | `/jacklink/audio/sinks/order` | `string …` | Set the display order by name-or-key. Omitted slots keep their relative order at the end. |
+| `/jacklink/audio/sinks/set` | `string …` | Replace the whole sink list with these names, in display order. Sinks not named are removed; no arguments removes all. |
 | `/jacklink/audio/source/add` | `string peer, string channel` | Append a source. Rejected if that pair is already present. |
 | `/jacklink/audio/source/remove` | `string peer, string channel` *or* `string key` | Remove that source. |
 | `/jacklink/audio/source/reset-dropouts` | *(none)*, `string key`, *or* `string peer, string channel` | Zero the dropout count — of every source with no arguments, otherwise of the one named. |
 | `/jacklink/audio/sources/order` | `string …` | Set the display order by key. Omitted slots keep their relative order at the end. |
+| `/jacklink/audio/sources/set` | `string peer, string channel, …` | Replace the whole source list with these pairs, in display order. Sources not named are removed; no arguments removes all. |
 
-Every command is *imperative and identity-based*: it names what to change rather than restating the
-whole list, so a client never has to read-modify-write, and two clients issuing different commands
-can't clobber each other. Each one stages a change to the desired list and lets a single idempotent
-reconcile pass apply it, which is where all the validation lives.
+Most commands are *imperative and identity-based*: they name what to change rather than restating
+the whole list, so a client never has to read-modify-write, and two clients issuing different
+commands can't clobber each other. Each one stages a change to the desired list and lets a single
+idempotent reconcile pass apply it, which is where all the validation lives.
+
+The two `set` commands are the declarative exception, for restoring a whole saved arrangement at
+once — see [Replacing the whole list](#replacing-the-whole-list).
 
 Rejected entries (empty or duplicate sink name, duplicate source, slot-key collision) are skipped
 and the rest is applied; the resulting canonical lists are pushed on

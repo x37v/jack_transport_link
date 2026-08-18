@@ -2021,6 +2021,36 @@ void JackTransportLink::processOscMessage(
       mDesiredSinks = std::move(reordered);
       mNeedsReconcileSinks.store(true, std::memory_order_release);
     } else if (mLinkAudioEnabled &&
+               std::strcmp("/jacklink/audio/sinks/set", m.AddressPattern()) == 0) {
+      // The whole desired list at once: every argument is an announced name, in display order,
+      // and a sink we hold that isn't named here gets removed. Unlike the imperative commands
+      // this deliberately does *not* seed from pendingSinks() -- it replaces the desired list
+      // rather than composing with it, which is what makes restoring a saved arrangement one
+      // reconcile (one deactivate/activate cycle) instead of a remove/add sequence.
+      //
+      // Entries are name-only, so they're self-keying: a "rename" expressed here reads as a
+      // remove plus an add, which is correct for a declarative name list -- a sink's key, and
+      // therefore its JACK port names, derive from its name.
+      std::vector<DesiredSink> desired;
+      for (; arg != m.ArgumentsEnd(); ++arg) {
+        if (!arg->IsString()) {
+          // A non-string in the list means we can't trust the list; applying part of it would
+          // silently delete the slots we couldn't read.
+          std::cerr << "warning: ignoring Link Audio sinks/set with a non-string argument\n";
+          return;
+        }
+        // reconcileSinks rejects an empty name on its own, but it does so per entry -- catching
+        // it here keeps the all-or-nothing contract, so a caller can't half-apply a list.
+        if (arg->AsStringUnchecked()[0] == '\0') {
+          std::cerr << "warning: ignoring Link Audio sinks/set with an empty name\n";
+          return;
+        }
+        desired.push_back({std::string(), arg->AsStringUnchecked()});
+      }
+      // No arguments is a legal empty list: remove every sink.
+      mDesiredSinks = std::move(desired);
+      mNeedsReconcileSinks.store(true, std::memory_order_release);
+    } else if (mLinkAudioEnabled &&
                std::strcmp("/jacklink/audio/source/add", m.AddressPattern()) == 0) {
       if (arg != m.ArgumentsEnd() && arg->IsString()) {
         const std::string peer = (arg++)->AsStringUnchecked();
@@ -2082,6 +2112,42 @@ void JackTransportLink::processOscMessage(
       }
       reordered.insert(reordered.end(), current.begin(), current.end());
       mDesiredSources = std::move(reordered);
+      mNeedsReconcileSources.store(true, std::memory_order_release);
+    } else if (mLinkAudioEnabled &&
+               std::strcmp("/jacklink/audio/sources/set", m.AddressPattern()) == 0) {
+      // The sources counterpart of sinks/set: (peer, channel) pairs, in display order, and a
+      // source we hold that isn't named here gets removed. Replaces the desired list rather
+      // than composing with it -- see sinks/set.
+      std::vector<DesiredSource> desired;
+      for (; arg != m.ArgumentsEnd(); ++arg) {
+        if (!arg->IsString()) {
+          std::cerr << "warning: ignoring Link Audio sources/set with a non-string argument\n";
+          return;
+        }
+        const std::string peer = (arg++)->AsStringUnchecked();
+        // An odd argument count leaves a peer with no channel. Reject the whole message: a
+        // truncated list would delete the slots that got cut off.
+        if (arg == m.ArgumentsEnd()) {
+          std::cerr << "warning: ignoring Link Audio sources/set with an unpaired peer \""
+                    << peer << "\"\n";
+          return;
+        }
+        if (!arg->IsString()) {
+          std::cerr << "warning: ignoring Link Audio sources/set with a non-string channel for peer \""
+                    << peer << "\"\n";
+          return;
+        }
+        // An empty channel would read as a key-only entry in reconcileSources and get dropped
+        // there, silently shortening the list; reject the message instead.
+        if (arg->AsStringUnchecked()[0] == '\0') {
+          std::cerr << "warning: ignoring Link Audio sources/set with an empty channel for peer \""
+                    << peer << "\"\n";
+          return;
+        }
+        desired.push_back({std::string(), peer, arg->AsStringUnchecked()});
+      }
+      // No arguments is a legal empty list: remove every source.
+      mDesiredSources = std::move(desired);
       mNeedsReconcileSources.store(true, std::memory_order_release);
     }
   } catch (oscpack::Exception &e) {
