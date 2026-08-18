@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -226,6 +227,14 @@ public:
       moStartReadPos =
           linearInterpolate(targetBeatsAtBufferBegin, *startBufferBegin,
                             *startBufferEnd, 0.0, double(info.numFrames));
+
+      // The cursor has just been seeked to exact alignment, so whatever position error the rate
+      // had accumulated to correct is gone with it. Carrying that correction forward would drive
+      // the freshly aligned cursor straight back off -- integral windup across a re-seek. The
+      // rate estimate itself costs little to rebuild: sender and receiver are both near their
+      // nominal rate, so unity is a good starting point and the loop re-converges from there.
+      mHasIncrement = false;
+      mIncrement = 1.0;
     }
 
     const auto startFramePos = *moStartReadPos;
@@ -309,7 +318,49 @@ public:
       return;
     }
 
-    const auto frameIncrement = totalFrames / double(numFrames);
+    // The per-block quotient is the right *average* rate but a noisy instantaneous one: the
+    // endpoint is located inside buffer ranges whose stamps jitter by a fraction of a millisecond,
+    // which on a short JACK block is a large fraction of the block itself (measured: ~0.9ms of
+    // jitter on a 5.8ms block, so ~16% rate error every block). Feeding that straight to the
+    // resampler modulates pitch at block rate, which is audible as distortion even when no block
+    // ever starves.
+    //
+    // Sender and receiver run at their own clocks, so the true rate is near 1 and drifts slowly.
+    // Smoothing recovers it: totalFrames is measured from the *current* read position each block,
+    // so the quotient already carries accumulated position error, and a first-order filter over it
+    // is an integral controller -- it still tracks real drift and a latency change, just over
+    // ~1s instead of instantly, while rejecting per-block stamp noise.
+    const double rawIncrement = totalFrames / double(numFrames);
+    const double blockSeconds =
+        sampleRate > 0.0 ? double(numFrames) / sampleRate : 0.0;
+    if (blockSeconds != mRateAlphaForBlockSeconds) {
+      mRateAlphaForBlockSeconds = blockSeconds;
+      mRateAlpha = blockSeconds > 0.0
+                       ? 1.0 - std::exp(-blockSeconds / kRateTimeConstantSeconds)
+                       : 1.0;
+    }
+    if (mHasIncrement) {
+      mIncrement += (rawIncrement - mIncrement) * mRateAlpha;
+    } else {
+      mIncrement = rawIncrement;
+      mHasIncrement = true;
+    }
+    // A wild quotient (a stamp far out of line) must never run the reader off at speed.
+    mIncrement = std::min(std::max(mIncrement, 0.5), 2.0);
+
+    // Two known limitations, both measured and deliberately left in place:
+    //
+    // 1. This is one filtered quotient doing two jobs -- estimating the clock ratio and
+    //    correcting position error -- which makes the closed loop second-order and underdamped:
+    //    a disturbance rings rather than settling cleanly, and the rate is observed wandering
+    //    about +/-1% (roughly 17 cents, well under a second per cycle) even on a healthy stream.
+    //    Audible on sustained tonal material if at all. The principled fix is a DLL with
+    //    separate position and rate terms rather than a single smoothed quotient, which is a
+    //    redesign of the receive cursor and wants its own measurements.
+    // 2. While the rate is pinned at either clamp there is no anti-windup and no resynchronise
+    //    threshold, so position error can accumulate. It self-limits in practice: an error that
+    //    large ends in a starve, and the starve path re-seeks and resets this filter.
+    const auto frameIncrement = mIncrement;
     auto readPos = startFramePos;
 
     const size_t srcChannels = (*mpQueueReader)[0]->mInfo.numChannels;
@@ -413,6 +464,8 @@ public:
       // measure its gap against this source's last arrival (seconds stale on a
       // switch/reconnect) and report a huge spurious jitter spike.
       mHasLastArrival = false;
+      mHasIncrement = false;
+      mIncrement = 1.0;
       mJitterMs.store(0.0f, std::memory_order_relaxed);
       mDropoutCount.store(0, std::memory_order_relaxed);
       mArrivalOffsetMs.store(0.0f, std::memory_order_relaxed);
@@ -463,6 +516,7 @@ public:
     mLastArrival = now;
     mHasLastArrival = true;
 
+
     if (mpQueueWriter->retainSlot()) {
       auto &buffer = *((*mpQueueWriter)[0]);
       buffer.mInfo = bufferHandle.info;
@@ -484,6 +538,18 @@ private:
   double &mSampleRate;
 
   std::optional<double> moStartReadPos;
+  // Smoothed resample rate. Render thread only.
+  //
+  // The filter is specified as a time constant, not as a per-block coefficient: a fixed
+  // per-block alpha would silently change meaning with the period size and sample rate (the
+  // same 1/128 is 0.37s at 128 frames and 1.48s at 512), which changes both noise rejection and
+  // how the loop settles. The coefficient is derived from the actual block duration and cached,
+  // so the exp() is paid only when the block size or sample rate changes.
+  static constexpr double kRateTimeConstantSeconds = 0.75;
+  double mIncrement = 1.0;
+  bool mHasIncrement = false;
+  double mRateAlpha = 0.0;
+  double mRateAlphaForBlockSeconds = 0.0;
   std::atomic<float> mBuffered = 0;
   // Written only by the render (RT) thread, read by the control thread.
   std::atomic<bool> mRendering{false};
@@ -493,7 +559,7 @@ private:
   // RT thread; jitter updated in onSourceBuffer on the Link thread; both read
   // non-RT for publishing.
   std::atomic<uint32_t> mDropoutCount{0};
-  std::atomic<float> mJitterMs{0.0f};
+  std::atomic<float> mJitterMs{0.0f};private:
   std::chrono::steady_clock::time_point mLastArrival{};
   bool mHasLastArrival = false;
 
