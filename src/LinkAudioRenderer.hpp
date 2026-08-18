@@ -236,6 +236,7 @@ public:
     // Locate the end of this JACK block on the incoming beat timeline.
     // totalFrames is the fractional amount of source audio spanning from the
     // queue head to that endpoint, possibly crossing several network buffers.
+    uint64_t prevCount = 0;
     for (auto i = 0u; i < mpQueueReader->numRetainedSlots(); ++i) {
       const auto &info = (*mpQueueReader)[i]->mInfo;
       const auto bufferBegin = info.beginBeats(sessionState, quantum);
@@ -250,6 +251,31 @@ public:
         break;
       }
 
+      // The mapped ranges do not tile exactly: a buffer's end is derived from its own frame
+      // count while the next one's begin comes from the sender's stamp, so consecutive ranges
+      // jitter by a fraction of a millisecond either way -- sometimes overlapping, sometimes
+      // leaving a seam. Measured against Ableton Live: ~125-frame buffers with seams around
+      // 0.9ms, roughly one boundary in five. Requiring strict containment turned every target
+      // that landed in a seam into a dropout, which silenced the block and reset the read
+      // position ~12 times a second on a stream that was otherwise perfectly healthy (no loss,
+      // no reordering, no starvation). A seam is not missing audio, so clamp to the boundary.
+      if (targetBeatsAtBufferEnd < *bufferBegin) {
+        // What separates a seam from missing audio is contiguity, not the size of the gap: if
+        // this buffer is the sender's very next one, nothing was lost and the gap is an artifact
+        // of the stamps. A skipped count means audio really is absent, and that must still be
+        // reported as a dropout rather than silently stretched over -- leaving foundEnd false
+        // takes the starve path below. (Deliberately not a gap-size threshold: the measured seam
+        // is about a third of a buffer and a single lost packet is one whole buffer, so any
+        // constant sits in between and would rot as buffer sizes change.)
+        const bool contiguous = i > 0 && info.count == prevCount + 1;
+        if (contiguous) {
+          // totalFrames already covers every buffer before this one, which is exactly the
+          // boundary the target fell just short of.
+          foundEnd = true;
+        }
+        break;
+      }
+
       if (targetBeatsAtBufferEnd >= *bufferBegin &&
           targetBeatsAtBufferEnd < *bufferEnd) {
         totalFrames +=
@@ -260,6 +286,7 @@ public:
       } else {
         totalFrames += double(info.numFrames);
       }
+      prevCount = info.count;
     }
 
     if (!foundEnd) {
