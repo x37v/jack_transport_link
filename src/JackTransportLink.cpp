@@ -100,6 +100,16 @@ bool get_property(jack_uuid_t subject, const std::string &key,
   return true;
 }
 
+// Preventative: port UUIDs are derived from the port index, and the server's metadata DB is only
+// deleted on an orderly shutdown — a kill or a crash leaves the file behind with every entry in it
+// — so a port we just registered can come up carrying the properties of whatever held that index
+// last. Wipe it before we write our own.
+void clear_port_properties(jack_client_t *client, jack_port_t *port) {
+  if (!port) return;
+  jack_uuid_t u = jack_port_uuid(port);
+  if (!jack_uuid_empty(u)) jack_remove_properties(client, u);
+}
+
 // Sanitize a requested playout-buffer value: non-finite (NaN/inf) reverts to the default,
 // otherwise clamp to [0, 2000]. NaN must be caught here — std::clamp passes NaN through, and a
 // NaN mLatencyMs would break the self-feedback guard (NaN != NaN) and produce NaN beat targets.
@@ -1577,6 +1587,8 @@ void JackTransportLink::registerSlotPorts(const std::string& key, bool input,
                              JACK_DEFAULT_AUDIO_TYPE, flags, 0);
   portR = jack_port_register(mJackClient, (base + "_r").c_str(),
                              JACK_DEFAULT_AUDIO_TYPE, flags, 0);
+  clear_port_properties(mJackClient, portL);
+  clear_port_properties(mJackClient, portR);
 }
 
 // Reconcile the live sink slots against `desired`. One pass covers add, remove, rename and
