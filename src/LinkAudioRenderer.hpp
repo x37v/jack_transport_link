@@ -115,6 +115,30 @@ public:
       mRendering.store(false, std::memory_order_relaxed);
     };
 
+    // A source was torn down and asked for a clean slate (removeSource(), control thread). The
+    // reset happens *here*, on the render thread, because everything it touches is render-thread
+    // state: the queue's reader side may only be advanced by its reader (SPSC), and the read
+    // cursor and rate filter below are ours alone. Doing it from the control thread raced a live
+    // read -- the reconcile path only got away with it because jack_deactivate() had stopped the
+    // RT callback, and the channels-changed path (a peer's channel appearing or vanishing) has no
+    // such guarantee and must not deactivate, since that drops the connections of every port we
+    // own rather than this slot's.
+    //
+    // Bounded work: releasing a retained slot is index arithmetic, the queue holds a fixed number
+    // of them, and the render loop below does the same thing every block.
+    if (mNeedsReset.exchange(false, std::memory_order_acquire)) {
+      while (mpQueueReader->retainSlot()) {
+      }
+      while (mpQueueReader->numRetainedSlots() > 0) {
+        mpQueueReader->releaseSlot();
+      }
+      moStartReadPos = std::nullopt;
+      // Same reasoning as the re-seek below: a rate correction accumulated for a stream that is
+      // gone would only drive the next one off.
+      mHasIncrement = false;
+      mIncrement = 1.0;
+    }
+
     // Make every buffer published by the Link callback visible to this render
     // pass. Retained slots stay readable until releaseSlot() advances the head
     // of the queue.
@@ -446,17 +470,21 @@ public:
         });
   }
 
+  // Control thread. Note what this does *not* do: touch the queue's reader side or the read
+  // cursor. Those are the render thread's (see the reset in receive()), and no amount of fencing
+  // from here would make releasing a slot under a live read legal. All this does is stop the
+  // writer and ask for the reset -- so it never blocks, and there is no window in which the two
+  // threads are both in the queue.
+  //
+  // If the render thread never runs again (a dead or deactivated JACK), the reset simply doesn't
+  // happen: the stale buffers sit in the queue until the next block or until this renderer is
+  // destroyed, and nothing reads them in the meantime.
   void removeSource() {
     if (mpSource) {
       mpSource.reset();
-
-      while (mpQueueReader->retainSlot()) {
-      }
-      while (mpQueueReader->numRetainedSlots() > 0) {
-        mpQueueReader->releaseSlot();
-      }
-
-      moStartReadPos = std::nullopt;
+      // Ordered after the reset above, so the render thread cannot observe the request while the
+      // old source is still publishing into the queue.
+      mNeedsReset.store(true, std::memory_order_release);
 
       // Reset health to a clean per-connection slate. Safe here: mpSource is
       // destroyed above, so no onSourceBuffer callback can be running. Without
@@ -464,8 +492,6 @@ public:
       // measure its gap against this source's last arrival (seconds stale on a
       // switch/reconnect) and report a huge spurious jitter spike.
       mHasLastArrival = false;
-      mHasIncrement = false;
-      mIncrement = 1.0;
       mJitterMs.store(0.0f, std::memory_order_relaxed);
       mDropoutCount.store(0, std::memory_order_relaxed);
       mArrivalOffsetMs.store(0.0f, std::memory_order_relaxed);
@@ -532,6 +558,10 @@ public:
   }
 
 private:
+  // Raised by removeSource() on the control thread, consumed by receive() on the render thread:
+  // the one piece of cross-thread state the teardown needs, in place of sharing the queue.
+  std::atomic<bool> mNeedsReset{false};
+
   Link &mLink;
   size_t mNumChannels;
   std::unique_ptr<LinkAudioSource> mpSource;
@@ -559,7 +589,7 @@ private:
   // RT thread; jitter updated in onSourceBuffer on the Link thread; both read
   // non-RT for publishing.
   std::atomic<uint32_t> mDropoutCount{0};
-  std::atomic<float> mJitterMs{0.0f};private:
+  std::atomic<float> mJitterMs{0.0f};
   std::chrono::steady_clock::time_point mLastArrival{};
   bool mHasLastArrival = false;
 
