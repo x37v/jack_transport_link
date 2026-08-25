@@ -66,6 +66,7 @@ control surfaces below:
 | `-N, --link-name <name>` | Link peer name to broadcast; empty uses the hostname. |
 | `-o, --osc-port <port>` | UDP port for the OSC interface. Default `3234`, searched upwards over 16 ports; an explicit port is used as given. See [Binding the OSC port](#binding-the-osc-port). |
 | `--no-osc` | Disable OSC entirely (enabled by default). **Also disables the Link Audio bridge**, which is OSC-only. |
+| `--osc-bind-any` | Bind the OSC socket on every interface instead of loopback only. Off by default — see [Binding the OSC port](#binding-the-osc-port). |
 | `-c, --config <path>` | Config file path (see [Config File](#config-file)). |
 | `-s / -S` | Enable / disable transport start-stop sync with Link peers. |
 | `--link / --no-link` | Join / don't join the Link session (default: join). |
@@ -118,7 +119,9 @@ JACK client subject. **Access** is `R/W` (client may write; service also publish
 applied value) or `R` (read-only, published by the service). Deleting a writable property
 reverts it to its default where noted.
 
-This is the complete list: everything else moved to [OSC](#osc-control).
+This is the complete list of *client* keys: everything else moved to [OSC](#osc-control). The
+service also sets [per-port metadata](#per-port-metadata) on its Link Audio ports, whose subject
+is the port rather than the client.
 
 **Type URIs:** `decimal` = `https://www.w3.org/2001/XMLSchema#decimal`, `integer` =
 `https://www.w3.org/2001/XMLSchema#integer`, `boolean` = `https://www.w3.org/2001/XMLSchema#boolean`,
@@ -133,15 +136,27 @@ This is the complete list: everything else moved to [OSC](#osc-control).
 | `link/start-stop-sync` | boolean | R/W | Synchronize transport start/stop with start-stop-enabled Link peers. |
 | `link/enabled` | boolean | R/W | Master Link on/off. When off, peers don't see this device (tempo sync + Link Audio inactive); JACK transport keeps running locally. Delete → reverts to enabled. |
 | `linkpeers` | integer | R | Number of currently connected Link peers. |
-| `osc-port` | integer | R | The UDP port the OSC interface actually bound. Absent when started with `--no-osc`. This is how a client finds the [OSC interface](#osc-control) — and because JACK removes a client's properties when it disconnects, this key disappearing and reappearing is also how a client learns the service restarted and its listener registration needs renewing. |
+| `osc-port` | integer | R | The UDP port the OSC interface actually bound. Absent when started with `--no-osc`. This is how a client finds the [OSC interface](#osc-control) — and because JACK removes a client's properties when it disconnects, this key disappearing and reappearing is also how a client learns the service restarted and its listener registration needs renewing. Deleting it by hand doesn't turn anything off — the service re-publishes it, as it does every other key it owns. |
 
 ### Per-port metadata
 
-The service also sets JACK's three standard presentation keys on its own Link Audio audio ports,
-subject = the *port* UUID rather than the client: `port-group` (`jack-link-audio`),
-`pretty-name` (a sink's name, or a source's `"<peer>: <channel>"`, suffixed `" L"` / `" R"`) and
-`order` (following the display order). They live here rather than on OSC precisely because a
-generic patchbay finds them by looking up the port it is already drawing.
+The service also decorates its own Link Audio ports, subject = the *port* UUID rather than the
+client. Three of the four keys are JACK's standard presentation keys, which live here rather than
+on OSC precisely because a generic patchbay finds them by looking up the port it is already
+drawing; the fourth is the slot key, which is what a *client* joins a port back to its OSC slot
+with.
+
+| Key | Value on a sink port | Value on a source port |
+|-----|----------------------|------------------------|
+| `port-group` (`http://jackaudio.org/metadata/port-group`) | `Link: Sends` — every sink in one group | `Link: <peer>` — one group per source peer |
+| `pretty-name` (`http://jackaudio.org/metadata/pretty-name`) | `<name> L` / `<name> R` | `<channel> L` / `<channel> R` (the peer is in the group name) |
+| `order` (`http://jackaudio.org/metadata/order`) | `1`, `2`, `3`… following the display order | same, numbered independently of the sinks |
+| `link/audio/slot` (`http://www.x37v.info/jack/metadata/link/audio/slot`) | the sink's 12-hex-digit [slot key](#slot-keys-and-port-names) | the source's slot key |
+
+The slot key is the machine-readable join: `port-group` and `pretty-name` are presentation
+strings that change when a sink is renamed or a peer renames itself, whereas this key is exactly
+the `key` field of the `sinks` / `sources` / `source-status` state payloads. Match on it rather
+than parsing a group or pretty name.
 
 ## Link Audio
 
@@ -189,8 +204,10 @@ Two consequences worth knowing:
   the source side: the old identity is simply gone, and that source goes disconnected.
 
 Hashed port names are not a UI problem: each port carries JACK `pretty-name` metadata (a sink's
-name, a source's `"<peer>: <channel>"`, suffixed " L"/" R") plus an `order` following the
-display order, so patchbays show and sort them sensibly.
+name, or a source's channel name, suffixed `" L"` / `" R"`), a `port-group` (`Link: Sends` for
+sinks, `Link: <peer>` for sources) and an `order` following the display order, so patchbays show,
+group and sort them sensibly. Each port also carries its slot key — see
+[per-port metadata](#per-port-metadata).
 
 ### Adding and removing sinks
 
@@ -383,6 +400,18 @@ imperative equivalents of the transport/Link settings that live in metadata.
 With no `-o`, the service binds the first free port in `3234`–`3249` and publishes the one it got
 as the `osc-port` metadata key. With an explicit `-o <port>` it makes exactly one attempt.
 
+**Loopback only, by default.** The socket binds `127.0.0.1`, so only clients on this machine can
+reach it. The command surface is unauthenticated and partly destructive — an argument-less
+`/jacklink/audio/sinks/set` legitimately means "remove every sink", the reconcile persists that
+within a second, and `/jacklink/listeners/clear` silences every client — so one datagram from any
+host that can reach the port is enough to wipe a device's Link Audio arrangement across restarts.
+`--osc-bind-any` binds every interface (`0.0.0.0`) for the cases that need it; treat it as opting
+the device's audio routing into whatever the network can send.
+
+While bound to loopback, listener registrations for non-loopback addresses are rejected with a log
+line rather than accepted: a `sendto()` to a routable address from a loopback-bound socket doesn't
+arrive, so registering one would be a silent no-op.
+
 Every failure is **fatal** — a jack_transport_link with no OSC socket has no Link Audio bridge at
 all, and on a headless device a unit that failed to start is far easier to diagnose than one that
 came up quietly half-working. That covers an explicit port already in use, the whole default range
@@ -409,8 +438,11 @@ at all. Register with the port you want it sent to:
 | `/jacklink/listeners/clear` | *(none)* | Unregister everything. |
 
 The snapshot goes to the endpoint named in the payload, **not** to the datagram's source — a
-client generally sends from an ephemeral port and listens on a declared one. A port outside
-`1`–`65535`, an unresolvable address, or our own receive port on loopback is rejected.
+client generally sends from an ephemeral port and listens on a declared one. Rejected (with a log
+line): a port outside `1`–`65535`, our own receive port, a non-loopback address while the socket is
+bound to loopback, and any address that isn't a numeric IPv4 literal — host *names* are never
+resolved, because `getaddrinfo` would block the single OSC thread for the resolver timeout and
+stall every transport command behind it.
 
 Snapshotting even a duplicate registration is the point, not sloppiness: if the *client* restarts
 while the service doesn't, its registration is still here, so ignoring the duplicate would send
