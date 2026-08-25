@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <map>
@@ -8,6 +9,7 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <jack/jack.h>
@@ -69,7 +71,7 @@ public:
                     double captureLatencyTrimMs = 0.0,
                     double playbackLatencyTrimMs = 0.0,
                     double latencyMs = 100.0,
-                    bool syncToIncomingAudio = true,
+                    bool syncToIncomingAudio = false,
                     bool linkEnabled = true,
                     OscIO *osc = nullptr);
   ~JackTransportLink();
@@ -114,12 +116,40 @@ private:
   // read by the RT process callback) and re-send the read-only latency values.
   void recomputeEffectiveLatency();
 
-  // The Link Audio state push. Each of these builds its payload, compares it against what was last
-  // sent and queues a datagram only on a real change — and each returns before building anything
-  // when no listener is registered, which is what makes the 4 Hz telemetry timer free on an
-  // idle device.
+  // The Link Audio state push. One row per pushed state address, and the single place any of them
+  // is described: buildState() knows how to produce the payload, stateAddress() where it goes,
+  // and everything else — the change-guarded senders, the snapshot, the periodic re-publish —
+  // iterates this enum. It used to be three hand-maintained lists that had to agree.
+  enum class StateId {
+    Available,
+    Channels,
+    PeerName,
+    LatencyMs,
+    SyncToIncoming,
+    Sinks,
+    Sources,
+    SourceStatus,
+    CaptureLatencyMs,
+    PlaybackLatencyMs,
+    CaptureLatencyAutoMs,
+    PlaybackLatencyAutoMs,
+    Count
+  };
+  static constexpr size_t kStateCount = static_cast<size_t>(StateId::Count);
+  // The wire type of a state value doubles as the change-guard comparison, so the alternative
+  // chosen here is what decides `bool` vs `float` vs `string` on the wire. Keep the builders
+  // returning the exact alternative each address is documented with.
+  using StateValue = std::variant<bool, float, std::string>;
+  static const char* stateAddress(StateId id);
+  StateValue buildState(StateId id);
+  static std::string encodeState(StateId id, const StateValue& value);
+  // Build, compare against what the listeners already hold, and queue only on a real change.
+  // Returns before building anything when no listener is registered, which is what makes the
+  // 4 Hz telemetry timer free on an idle device.
+  void sendState(StateId id);
+  // Named wrappers, so call sites keep saying what they mean.
   void sendLinkAudioAvailable();
-  void sendLinkAudioChannels(const std::vector<ableton::LinkAudio::Channel>& channels);
+  void sendLinkAudioChannels();
   void sendLinkAudioPeerName();
   void sendLinkAudioLatencyMs();
   void sendLinkAudioSyncToIncoming();
@@ -280,6 +310,9 @@ private:
   // Peer count recorded by Link's callback thread, published from processEvents.
   std::atomic<size_t> mNumPeers{0};
   std::atomic<bool> mReportNumPeers{false};
+  // osc-port was deleted out from under us and needs re-publishing; jack_set_property doesn't
+  // belong on the property-change callback thread, so processEvents does it.
+  std::atomic<bool> mNeedsPublishOscPort{false};
 
   std::atomic<bool> mChannelsChanged{false};
   bool mLinkAudioEnabled = false;
@@ -357,20 +390,11 @@ private:
     std::string packet;
   };
   std::vector<OscOut> mOscOutbox;
-  // What the listeners were last sent, per state address; a send whose payload matches is skipped.
-  // nullopt = never sent, which always sends — that's also how the periodic re-publish forces one.
-  std::optional<bool> mSentAvailable;
-  std::optional<std::string> mSentChannelsJson;
-  std::optional<std::string> mSentPeerName;
-  std::optional<float> mSentLatencyMs;
-  std::optional<bool> mSentSyncToIncoming;
-  std::optional<std::string> mSentSinksJson;
-  std::optional<std::string> mSentSourcesJson;
-  std::optional<std::string> mSentSourceStatusJson;
-  std::optional<float> mSentCaptureLatencyMs;
-  std::optional<float> mSentPlaybackLatencyMs;
-  std::optional<float> mSentCaptureLatencyAutoMs;
-  std::optional<float> mSentPlaybackLatencyAutoMs;
+  // What the listeners were last sent, indexed by StateId; a send whose payload matches is
+  // skipped. nullopt = never sent, which always sends — that's also how the periodic re-publish
+  // forces one. Only ever written after the datagram is successfully encoded, so a payload too
+  // large for the encode buffer retries instead of being recorded as sent.
+  std::array<std::optional<StateValue>, kStateCount> mSentState;
   // Listeners owed a full snapshot, staged from the OSC thread. Guarded by mControlMutex.
   std::vector<oscpack::IpEndpointName> mPendingOscSnapshots;
   std::atomic<bool> mNeedsOscSnapshots{false};

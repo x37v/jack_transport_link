@@ -490,7 +490,7 @@ void JackTransportLink::processEventsLocked() {
       if (updateLinkAudioSource()) { mReportLinkAudioSource = true; mUpdatePortMeta = true; }
     }
     if (mReportLinkAudioChannels.exchange(false, std::memory_order_acq_rel)) {
-      sendLinkAudioChannels(mLink.channels());
+      sendLinkAudioChannels();
     }
     if (mReportLinkAudioSource.exchange(false, std::memory_order_acq_rel)) {
       // A connect/disconnect should show up at once rather than waiting out the telemetry
@@ -544,24 +544,34 @@ void JackTransportLink::processEventsLocked() {
   if (mReportNumPeers.exchange(false, std::memory_order_acq_rel)) {
     setNumPeersProperty(mNumPeers.load(std::memory_order_acquire));
   }
+  if (mNeedsPublishOscPort.exchange(false, std::memory_order_acq_rel)) {
+    setOscPortProperty();
+  }
   // A newly-registered listener gets everything at once, unconditionally.
   if (mNeedsOscSnapshots.exchange(false, std::memory_order_acq_rel)) {
     std::vector<oscpack::IpEndpointName> pending;
     std::swap(pending, mPendingOscSnapshots);
     for (const auto &endpoint : pending)
       sendOscSnapshot(endpoint);
-    // Restart the re-publish timer: it stops advancing while nobody is listening, so a first
-    // registration would otherwise be immediately followed by a re-publish of what it just got.
-    mLastOscRepublish = std::chrono::steady_clock::now();
   }
   // Counterweight to the change guards: re-send the low-rate state periodically so a lost datagram
   // can't leave a listener stale indefinitely. A few hundred bytes every couple of seconds.
+  //
+  // The clock is deliberately *not* touched by the snapshot drain above. It used to be, to keep a
+  // first registration from being followed immediately by a re-publish of what it had just been
+  // sent -- but that made the shared timer resettable by any single client, and the README
+  // recommends re-sending `listeners/add` as a heartbeat: a client heartbeating faster than 2s
+  // held the timer down forever, so a *second* listener that lost a datagram stayed stale
+  // indefinitely, which is the exact failure the re-publish exists to cover. Keeping the clock
+  // fresh while nobody is listening solves the original problem without that side effect.
   if (mOsc && mOsc->hasListeners()) {
     auto now = std::chrono::steady_clock::now();
     if (now - mLastOscRepublish >= std::chrono::seconds(2)) {
       mLastOscRepublish = now;
       republishOscState();
     }
+  } else {
+    mLastOscRepublish = std::chrono::steady_clock::now();
   }
   if (mNeedsSaveConfig.load(std::memory_order_acquire)) {
     auto now = std::chrono::steady_clock::now();
@@ -1012,10 +1022,17 @@ void JackTransportLink::propertyChangeCallback(jack_uuid_t subject,
   std::lock_guard<std::recursive_mutex> lock(mControlMutex);
   // if the subject is all or us and the key is all (empty) or bpm
   if ((jack_uuid_empty(subject) || subject == mJackClientUUID)) {
-    bool isbpm = !key || bpm_key.compare(key) == 0;
-    bool islinksync = !key || linksync_key.compare(key) == 0;
-    bool isenable = !key || start_stop_key.compare(key) == 0;
-    bool islinkenabled = !key || link_enabled_key.compare(key) == 0;
+    // "All properties of this subject" is signalled by an *empty* key, which jack/metadata.h
+    // documents and jackd sends as "" -- not as NULL. Testing only for NULL (as this did) meant
+    // the entire self-heal below never ran for a `jack_property --delete-all`, which is exactly
+    // the case it exists for: every key stayed deleted until the next JACK reconnect.
+    const bool allkeys = !key || key[0] == '\0';
+    bool isbpm = allkeys || bpm_key.compare(key) == 0;
+    bool islinksync = allkeys || linksync_key.compare(key) == 0;
+    bool isenable = allkeys || start_stop_key.compare(key) == 0;
+    bool islinkenabled = allkeys || link_enabled_key.compare(key) == 0;
+    bool isoscport = allkeys || osc_port_key.compare(key) == 0;
+    bool isnumpeers = allkeys || linknumpeers_key.compare(key) == 0;
     // Treat a newly-created property the same as a changed one. Properties that
     // jack_transport_link doesn't publish itself arrive as PropertyCreated, not
     // PropertyChanged.
@@ -1078,6 +1095,17 @@ void JackTransportLink::propertyChangeCallback(jack_uuid_t subject,
         mNeedsPublishLinkEnabled.store(true, std::memory_order_release);
         mNeedsSaveConfig = true;
       }
+      // Self-heal discovery too, and for a stronger reason than the rest: without osc-port a
+      // client can't find the OSC interface at all, and per the README its absence positively
+      // means "no Link Audio bridge here". A `jack_property --delete-all` against our subject
+      // (or another program's defensive jack_remove_properties) would otherwise leave that lie
+      // in place until the next JACK reconnect.
+      if (isoscport)
+        mNeedsPublishOscPort.store(true, std::memory_order_release);
+      // Read-only telemetry, but leaving a hole until the peer count next changes is a worse
+      // answer than the value we already have.
+      if (isnumpeers)
+        mReportNumPeers = true;
     }
   }
 }
@@ -1204,103 +1232,121 @@ std::string JackTransportLink::buildSourceStatusJson() const {
   return arr.dump();
 }
 
-// ---------------------------------------------------------------------------------------------
-// Link Audio state push.
-//
-// Three gates, in order, and the order is the point: nobody listening means the payload is never
-// even built; an unchanged payload is never sent; and the noisy floats are quantized before the
-// comparison so wobble can't defeat it. The periodic re-publish in processEvents is the
-// counterweight, so a dropped datagram can't leave a listener stale forever.
-// ---------------------------------------------------------------------------------------------
-
-void JackTransportLink::sendLinkAudioAvailable() {
-  if (!mOsc || !mOsc->hasListeners()) return;
-  // Explicit rather than implied: jack_transport_link can run with Link Audio disabled (-A), and
-  // over OSC there is no "the channels key isn't readable" tell.
-  const bool v = mLinkAudioEnabled;
-  if (mSentAvailable && *mSentAvailable == v) return;
-  mSentAvailable = v;
-  queueOsc(oscBoolMessage(state_available_address, v));
+const char* JackTransportLink::stateAddress(StateId id) {
+  switch (id) {
+  case StateId::Available:             return state_available_address;
+  case StateId::Channels:              return state_channels_address;
+  case StateId::PeerName:              return state_peer_name_address;
+  case StateId::LatencyMs:             return state_latency_address;
+  case StateId::SyncToIncoming:        return state_sync_to_incoming_address;
+  case StateId::Sinks:                 return state_sinks_address;
+  case StateId::Sources:               return state_sources_address;
+  case StateId::SourceStatus:          return state_source_status_address;
+  case StateId::CaptureLatencyMs:      return state_capture_latency_address;
+  case StateId::PlaybackLatencyMs:     return state_playback_latency_address;
+  case StateId::CaptureLatencyAutoMs:  return state_capture_latency_auto_address;
+  case StateId::PlaybackLatencyAutoMs: return state_playback_latency_auto_address;
+  case StateId::Count:                 break;
+  }
+  return "";
 }
 
-void JackTransportLink::sendLinkAudioChannels(
-    const std::vector<ableton::LinkAudio::Channel>& channels) {
-  if (!mOsc || !mOsc->hasListeners()) return;
-  auto v = buildChannelsJson(channels);
-  if (mSentChannelsJson && *mSentChannelsJson == v) return;
-  mSentChannelsJson = v;
-  queueOsc(oscStringMessage(state_channels_address, v));
-}
-
-void JackTransportLink::sendLinkAudioPeerName() {
-  if (!mOsc || !mOsc->hasListeners()) return;
-  auto v = effectiveLinkPeerName();
-  if (mSentPeerName && *mSentPeerName == v) return;
-  mSentPeerName = v;
-  queueOsc(oscStringMessage(state_peer_name_address, v));
-}
-
-void JackTransportLink::sendLinkAudioLatencyMs() {
-  if (!mOsc || !mOsc->hasListeners()) return;
-  const float v = mLatencyMs.load(std::memory_order_acquire);
-  if (mSentLatencyMs && *mSentLatencyMs == v) return;
-  mSentLatencyMs = v;
-  queueOsc(oscFloatMessage(state_latency_address, v));
-}
-
-void JackTransportLink::sendLinkAudioSyncToIncoming() {
-  if (!mOsc || !mOsc->hasListeners()) return;
-  const bool v = mSyncToIncomingAudio.load(std::memory_order_acquire);
-  if (mSentSyncToIncoming && *mSentSyncToIncoming == v) return;
-  mSentSyncToIncoming = v;
-  queueOsc(oscBoolMessage(state_sync_to_incoming_address, v));
-}
-
-void JackTransportLink::sendLinkAudioSinks() {
-  if (!mOsc || !mOsc->hasListeners()) return;
-  auto v = buildSinksJson();
-  if (mSentSinksJson && *mSentSinksJson == v) return;
-  mSentSinksJson = v;
-  queueOsc(oscStringMessage(state_sinks_address, v));
-}
-
-void JackTransportLink::sendLinkAudioSources() {
-  if (!mOsc || !mOsc->hasListeners()) return;
-  auto v = buildSourcesJson();
-  if (mSentSourcesJson && *mSentSourcesJson == v) return;
-  mSentSourcesJson = v;
-  queueOsc(oscStringMessage(state_sources_address, v));
-}
-
-void JackTransportLink::sendLinkAudioSourceStatus() {
-  if (!mOsc || !mOsc->hasListeners()) return;
-  auto v = buildSourceStatusJson();
-  // With every source disconnected this payload is a constant all-zero array, so the 4 Hz stream
-  // collapses to just the periodic re-publish.
-  if (mSentSourceStatusJson && *mSentSourceStatusJson == v) return;
-  mSentSourceStatusJson = v;
-  queueOsc(oscStringMessage(state_source_status_address, v));
-}
-
-void JackTransportLink::sendLinkAudioLatencies() {
-  if (!mOsc || !mOsc->hasListeners()) return;
+// The current value of one state address, in the type it goes out as. The only place a state
+// payload is produced: the guarded senders, the snapshot and the re-publish all come through
+// here, so none of them can drift from the others.
+JackTransportLink::StateValue JackTransportLink::buildState(StateId id) {
+  // JACK reports latency in frames; the wire carries milliseconds.
   const double sr = mSampleRate > 0.0 ? mSampleRate : 48000.0;
   auto ms = [sr](jack_nframes_t frames) {
     return static_cast<float>(1000.0 * static_cast<double>(frames) / sr);
   };
-  auto send = [this](const char* address, float v, std::optional<float>& cache) {
-    if (cache && *cache == v) return;
-    cache = v;
-    queueOsc(oscFloatMessage(address, v));
-  };
-  send(state_capture_latency_address,
-       ms(mEffCaptureLatencyFrames.load(std::memory_order_acquire)), mSentCaptureLatencyMs);
-  send(state_playback_latency_address,
-       ms(mEffPlaybackLatencyFrames.load(std::memory_order_acquire)), mSentPlaybackLatencyMs);
-  send(state_capture_latency_auto_address,
-       ms(mAutoCaptureLatencyFrames.load(std::memory_order_acquire)), mSentCaptureLatencyAutoMs);
-  send(state_playback_latency_auto_address,
-       ms(mAutoPlaybackLatencyFrames.load(std::memory_order_acquire)), mSentPlaybackLatencyAutoMs);
+  switch (id) {
+  case StateId::Available:
+    // Explicit rather than implied: jack_transport_link can run with Link Audio disabled (-A),
+    // and over OSC there is no "the channels key isn't readable" tell.
+    return mLinkAudioEnabled;
+  case StateId::Channels:
+    return buildChannelsJson(mLink.channels());
+  case StateId::PeerName:
+    return effectiveLinkPeerName();
+  case StateId::LatencyMs:
+    return static_cast<float>(mLatencyMs.load(std::memory_order_acquire));
+  case StateId::SyncToIncoming:
+    return mSyncToIncomingAudio.load(std::memory_order_acquire);
+  case StateId::Sinks:
+    return buildSinksJson();
+  case StateId::Sources:
+    return buildSourcesJson();
+  case StateId::SourceStatus:
+    return buildSourceStatusJson();
+  case StateId::CaptureLatencyMs:
+    return ms(mEffCaptureLatencyFrames.load(std::memory_order_acquire));
+  case StateId::PlaybackLatencyMs:
+    return ms(mEffPlaybackLatencyFrames.load(std::memory_order_acquire));
+  case StateId::CaptureLatencyAutoMs:
+    return ms(mAutoCaptureLatencyFrames.load(std::memory_order_acquire));
+  case StateId::PlaybackLatencyAutoMs:
+    return ms(mAutoPlaybackLatencyFrames.load(std::memory_order_acquire));
+  case StateId::Count:
+    break;
+  }
+  return false;
+}
+
+std::string JackTransportLink::encodeState(StateId id, const StateValue& value) {
+  const char* address = stateAddress(id);
+  return std::visit(
+      [address](const auto& v) -> std::string {
+        using T = std::decay_t<decltype(v)>;
+        if constexpr (std::is_same_v<T, bool>)
+          return oscBoolMessage(address, v);
+        else if constexpr (std::is_same_v<T, float>)
+          return oscFloatMessage(address, v);
+        else
+          return oscStringMessage(address, v);
+      },
+      value);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Link Audio state push.
+//
+// Three gates, in order, and the order is the point: nobody listening means the payload is never
+// even built; an unchanged payload is never sent; and the noisy floats are quantized (in the JSON
+// builders) before the comparison so wobble can't defeat it. The periodic re-publish in
+// processEvents is the counterweight, so a dropped datagram can't leave a listener stale forever.
+// ---------------------------------------------------------------------------------------------
+
+void JackTransportLink::sendState(StateId id) {
+  if (!mOsc || !mOsc->hasListeners()) return;
+  auto value = buildState(id);
+  auto& cache = mSentState[static_cast<size_t>(id)];
+  if (cache && *cache == value) return;
+  auto packet = encodeState(id, value);
+  // Encoding only fails on a payload too large for the encode buffer. Leave the cache alone in
+  // that case: recording a value we never managed to send would make the change guard suppress
+  // every retry, and the listener would sit on stale state until the next re-publish.
+  if (packet.empty()) return;
+  cache = std::move(value);
+  queueOsc(std::move(packet));
+}
+
+void JackTransportLink::sendLinkAudioAvailable()      { sendState(StateId::Available); }
+void JackTransportLink::sendLinkAudioChannels()       { sendState(StateId::Channels); }
+void JackTransportLink::sendLinkAudioPeerName()       { sendState(StateId::PeerName); }
+void JackTransportLink::sendLinkAudioLatencyMs()      { sendState(StateId::LatencyMs); }
+void JackTransportLink::sendLinkAudioSyncToIncoming() { sendState(StateId::SyncToIncoming); }
+void JackTransportLink::sendLinkAudioSinks()          { sendState(StateId::Sinks); }
+void JackTransportLink::sendLinkAudioSources()        { sendState(StateId::Sources); }
+// With every source disconnected this payload is a constant all-zero array, so the 4 Hz stream
+// collapses to just the periodic re-publish.
+void JackTransportLink::sendLinkAudioSourceStatus()   { sendState(StateId::SourceStatus); }
+
+void JackTransportLink::sendLinkAudioLatencies() {
+  sendState(StateId::CaptureLatencyMs);
+  sendState(StateId::PlaybackLatencyMs);
+  sendState(StateId::CaptureLatencyAutoMs);
+  sendState(StateId::PlaybackLatencyAutoMs);
 }
 
 // Everything, to one endpoint, unconditionally. Bypasses the has-listeners gate (this endpoint just
@@ -1308,34 +1354,10 @@ void JackTransportLink::sendLinkAudioLatencies() {
 // nothing about this one — for the same reason it must not update them.
 void JackTransportLink::sendOscSnapshot(const oscpack::IpEndpointName& endpoint) {
   if (!mOsc) return;
-  const double sr = mSampleRate > 0.0 ? mSampleRate : 48000.0;
-  auto ms = [sr](jack_nframes_t frames) {
-    return static_cast<float>(1000.0 * static_cast<double>(frames) / sr);
-  };
-  queueOscTo(endpoint, oscBoolMessage(state_available_address, mLinkAudioEnabled));
-  queueOscTo(endpoint,
-             oscStringMessage(state_channels_address, buildChannelsJson(mLink.channels())));
-  queueOscTo(endpoint, oscStringMessage(state_peer_name_address, effectiveLinkPeerName()));
-  queueOscTo(endpoint, oscFloatMessage(state_latency_address,
-                                       mLatencyMs.load(std::memory_order_acquire)));
-  queueOscTo(endpoint,
-             oscBoolMessage(state_sync_to_incoming_address,
-                            mSyncToIncomingAudio.load(std::memory_order_acquire)));
-  queueOscTo(endpoint, oscStringMessage(state_sinks_address, buildSinksJson()));
-  queueOscTo(endpoint, oscStringMessage(state_sources_address, buildSourcesJson()));
-  queueOscTo(endpoint, oscStringMessage(state_source_status_address, buildSourceStatusJson()));
-  queueOscTo(endpoint,
-             oscFloatMessage(state_capture_latency_address,
-                             ms(mEffCaptureLatencyFrames.load(std::memory_order_acquire))));
-  queueOscTo(endpoint,
-             oscFloatMessage(state_playback_latency_address,
-                             ms(mEffPlaybackLatencyFrames.load(std::memory_order_acquire))));
-  queueOscTo(endpoint,
-             oscFloatMessage(state_capture_latency_auto_address,
-                             ms(mAutoCaptureLatencyFrames.load(std::memory_order_acquire))));
-  queueOscTo(endpoint,
-             oscFloatMessage(state_playback_latency_auto_address,
-                             ms(mAutoPlaybackLatencyFrames.load(std::memory_order_acquire))));
+  for (size_t i = 0; i < kStateCount; ++i) {
+    const auto id = static_cast<StateId>(i);
+    queueOscTo(endpoint, encodeState(id, buildState(id)));
+  }
 }
 
 // Force the state back out to every listener. Dropping the caches and re-running the normal senders
@@ -1346,28 +1368,10 @@ void JackTransportLink::sendOscSnapshot(const oscpack::IpEndpointName& endpoint)
 // all-zero array, so the timer stops sending and a single lost datagram would otherwise leave a
 // listener showing the last values it happened to see, forever.
 void JackTransportLink::republishOscState() {
-  mSentAvailable.reset();
-  mSentChannelsJson.reset();
-  mSentPeerName.reset();
-  mSentLatencyMs.reset();
-  mSentSyncToIncoming.reset();
-  mSentSinksJson.reset();
-  mSentSourcesJson.reset();
-  mSentSourceStatusJson.reset();
-  mSentCaptureLatencyMs.reset();
-  mSentPlaybackLatencyMs.reset();
-  mSentCaptureLatencyAutoMs.reset();
-  mSentPlaybackLatencyAutoMs.reset();
-
-  sendLinkAudioAvailable();
-  sendLinkAudioChannels(mLink.channels());
-  sendLinkAudioPeerName();
-  sendLinkAudioLatencyMs();
-  sendLinkAudioSyncToIncoming();
-  sendLinkAudioSinks();
-  sendLinkAudioSources();
-  sendLinkAudioSourceStatus();
-  sendLinkAudioLatencies();
+  for (auto& cache : mSentState)
+    cache.reset();
+  for (size_t i = 0; i < kStateCount; ++i)
+    sendState(static_cast<StateId>(i));
 }
 
 size_t JackTransportLink::findSinkByKey(const std::string& key) const {
@@ -2137,6 +2141,14 @@ void JackTransportLink::processOscMessage(
           return;
         }
         const std::string peer = (arg++)->AsStringUnchecked();
+        // A peer name is never empty, so an empty one means the argument list is misaligned --
+        // the same off-by-one class this handler rejects everywhere else. reconcileSources would
+        // happily accept {peer:"", channel:"Cue"} as an identity and register a slot whose ports
+        // can never match any advertised channel, having already replaced the saved arrangement.
+        if (peer.empty()) {
+          std::cerr << "warning: ignoring Link Audio sources/set with an empty peer\n";
+          return;
+        }
         // An odd argument count leaves a peer with no channel. Reject the whole message: a
         // truncated list would delete the slots that got cut off.
         if (arg == m.ArgumentsEnd()) {
