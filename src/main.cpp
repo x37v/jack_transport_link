@@ -165,6 +165,14 @@ int main(int argc, char *argv[]) {
       .set_default("1")
       .help("Disable the OSC interface entirely. Enabled by default; note that the Link Audio "
             "bridge is OSC-only, so a client will report Link Audio unavailable.");
+  parser.add_option("--osc-bind-any")
+      .action("store_true")
+      .dest("osc_bind_any")
+      .set_default("0")
+      .help("Bind the OSC receive socket on every interface (0.0.0.0) instead of loopback only. "
+            "The command surface is unauthenticated and partly destructive (an argument-less "
+            "audio/sinks/set removes every sink, and the change is persisted), so any host that "
+            "can reach the port can rearrange Link Audio; off by default.");
 
   parser.add_option("-c", "--config")
       .type("string")
@@ -267,6 +275,10 @@ int main(int argc, char *argv[]) {
   int oscport = options.get("oscport");
   const bool oscportExplicit = options.is_set_by_user("oscport");
   const bool oscEnabled = static_cast<bool>(options.get("osc_enabled"));
+  // Bind scope shares the port's reasoning for having no config-file tier: it belongs to the
+  // socket, alongside -o and --no-osc, and widening the exposure of an unauthenticated command
+  // surface should be visible in the unit file that starts the daemon.
+  const bool oscBindAny = static_cast<bool>(options.get("osc_bind_any"));
   bool enableLinkAudio = options.is_set_by_user("link_audio")
       ? static_cast<bool>(options.get("link_audio"))
       : configValue(cfg, "link_audio_enabled",
@@ -340,14 +352,14 @@ int main(int argc, char *argv[]) {
       return -1;
     }
     if (oscportExplicit) {
-      if (!osc.bind(oscport)) {
+      if (!osc.bind(oscport, oscBindAny)) {
         std::cerr << "could not bind osc port " << oscport << std::endl;
         return -1;
       }
     } else {
       const int last = oscport + 15;
       for (int p = oscport; p <= last && p <= 65535; p++) {
-        if (osc.bind(p)) break;
+        if (osc.bind(p, oscBindAny)) break;
       }
       if (!osc.bound()) {
         std::cerr << "could not bind an osc port in the range " << oscport << "-" << last
@@ -355,7 +367,8 @@ int main(int argc, char *argv[]) {
         return -1;
       }
     }
-    std::cout << "osc listening on port " << osc.port() << std::endl;
+    std::cout << "osc listening on " << (osc.anyAddress() ? "0.0.0.0" : "127.0.0.1") << ":"
+              << osc.port() << std::endl;
   }
 
   // One OSC thread for the life of the process, not one per JACK session.
