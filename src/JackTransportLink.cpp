@@ -62,9 +62,14 @@ const std::string order_key(JACK_METADATA_ORDER);
 const char *order_type = "http://www.w3.org/2001/XMLSchema#int";
 const std::array<std::string, 2> true_values = {"true", "1"};
 
-// The Link Audio state push, sent to every registered listener. Deliberately a different namespace
+// The state push, sent to every registered listener. Deliberately a different namespace
 // from the /jacklink/... command addresses we accept, so state can never be mistaken for a command
 // (in either direction, by either end).
+//
+// Transport state, which is not Link Audio and gets its own subtree -- it is published even with
+// -A, and nothing in the state machinery assumes the /audio/ infix.
+const char *state_timesig_address = "/jacklink/state/transport/timesig";
+// Link Audio state.
 const char *state_available_address = "/jacklink/state/audio/available";
 const char *state_channels_address = "/jacklink/state/audio/channels";
 const char *state_peer_name_address = "/jacklink/state/audio/peer-name";
@@ -157,6 +162,11 @@ std::string oscBoolMessage(const char *address, bool value) {
   return oscMessage(address, [value](oscpack::OutboundPacketStream &p) { p << value; });
 }
 
+std::string oscIntPairMessage(const char *address, int32_t a, int32_t b) {
+  return oscMessage(address,
+                    [a, b](oscpack::OutboundPacketStream &p) { p << a << b; });
+}
+
 std::optional<double>
 GetOscDouble(const oscpack::ReceivedMessageArgument &arg) {
   if (arg.IsDouble()) {
@@ -172,6 +182,18 @@ GetOscDouble(const oscpack::ReceivedMessageArgument &arg) {
     return static_cast<double>(arg.AsInt32());
   }
   return std::nullopt;
+}
+
+// An OSC number that is exactly an integer. Accepts i/f/d (a client has no reason to care which
+// it sends) but rejects anything non-integral -- 3.5 is not a time signature -- and anything
+// non-finite or out of int32 range, which would otherwise be undefined behaviour in the cast.
+std::optional<int32_t>
+GetOscInt(const oscpack::ReceivedMessageArgument &arg) {
+  std::optional<double> v = GetOscDouble(arg);
+  if (!v || !std::isfinite(*v) || *v != std::floor(*v) ||
+      *v < static_cast<double>(INT32_MIN) || *v > static_cast<double>(INT32_MAX))
+    return std::nullopt;
+  return static_cast<int32_t>(*v);
 }
 
 // A slot's key: the low 48 bits of an FNV-1a-64 hash of its identity, as 12 lowercase hex
@@ -208,10 +230,19 @@ std::string sourceSlotKey(const std::string& peer, const std::string& channel) {
 
 } // namespace
 
+// Note the power-of-two test: JACK's beat_type is a note value (1, 2, 4, 8, 16, 32), and the
+// MIDI clock's 96/D clocks-per-beat is only an integer for those. The upper bounds are sanity
+// limits, not anything JACK imposes.
+bool validTimeSig(int32_t beatsPerBar, int32_t beatType) {
+  return beatsPerBar >= 1 && beatsPerBar <= 64 && beatType >= 1 && beatType <= 32 &&
+         (beatType & (beatType - 1)) == 0;
+}
+
 JackTransportLink::JackTransportLink(jack_client_t *client,
                                      bool enableStartStopSync,
-                                     double initialBPM, double initialQuantum,
-                                     float initialTimeSigDenom,
+                                     double initialBPM,
+                                     int32_t initialBeatsPerBar,
+                                     int32_t initialBeatType,
                                      double initialTicksPerBeat,
                                      bool enableLinkAudio,
                                      bool syncLink,
@@ -229,10 +260,11 @@ JackTransportLink::JackTransportLink(jack_client_t *client,
       mOsc(osc),
       mSampleRate(static_cast<double>(jack_get_sample_rate(client))),
       mLinkPeerName(std::move(linkPeerName)),
-      mBPM(initialBPM), mLinkBPM(initialBPM), mQuantum(initialQuantum),
-      mInitialQuantum(initialQuantum),
-      mInitialTimeSigDenom(initialTimeSigDenom),
-      mInitialTicksPerBeat(initialTicksPerBeat),
+      mBPM(initialBPM), mLinkBPM(initialBPM),
+      mQuantum(static_cast<double>(initialBeatsPerBar) * 4.0 /
+               static_cast<double>(initialBeatType)),
+      mTimeSig(packTimeSig(initialBeatsPerBar, initialBeatType)),
+      mTicksPerBeat(initialTicksPerBeat),
       // Link peer name is decoupled from the JACK client name (which stays
       // "jack-transport-link" for the runner/port-bridge); default to the hostname.
       mLink(initialBPM, effectiveLinkPeerName()),
@@ -241,6 +273,15 @@ JackTransportLink::JackTransportLink(jack_client_t *client,
       mWasSyncLink(syncLink),
       mConfigPath(std::move(configPath)) {
   // setup listener
+
+  // Defensive: main validates the time signature at both the CLI and the config boundary, but a
+  // pair that got through anyway would divide by zero in the quantum above, so fall back to 4/4.
+  if (!validTimeSig(initialBeatsPerBar, initialBeatType)) {
+    std::cerr << "warning: invalid initial time signature " << initialBeatsPerBar << "/"
+              << initialBeatType << ", using 4/4\n";
+    mTimeSig.store(packTimeSig(4, 4), std::memory_order_relaxed);
+    mQuantum = 4.0;
+  }
 
   mCaptureLatencyTrimMs.store(captureLatencyTrimMs, std::memory_order_release);
   mPlaybackLatencyTrimMs.store(playbackLatencyTrimMs, std::memory_order_release);
@@ -525,6 +566,9 @@ void JackTransportLink::processEventsLocked() {
   if (mNeedsPublishSyncToIncoming.exchange(false, std::memory_order_acq_rel)) {
     sendLinkAudioSyncToIncoming();
   }
+  if (mNeedsPublishTimeSig.exchange(false, std::memory_order_acq_rel)) {
+    sendTimeSig();
+  }
   if (mNeedsApplyLinkEnabled.exchange(false, std::memory_order_acq_rel)) {
     // mLink.enable() is not RT-safe; applying here on the main thread is correct.
     mLink.enable(mLinkEnabledDesired.load(std::memory_order_acquire));
@@ -587,15 +631,33 @@ int JackTransportLink::processCallback(jack_nframes_t nframes, void *arg) {
   return reinterpret_cast<JackTransportLink *>(arg)->processCallback(nframes);
 }
 
+// Carry a tick overflow up into beats and bars.
+//
+// Advances by however many whole beats/bars the overflow represents, not one of each. The
+// single-step version this replaces was fine only while a click could never be longer than a
+// beat: with beat_type settable, the DO_CLICK_OUT path's clicksPerBeat = 4*(4/D) falls to 0.5 at
+// D=32, making ticksPerClick twice ticks_per_beat, and beat then lagged tick by a factor of two.
+// Note that fmod alone doesn't save you -- it reduces the tick correctly while beat still only
+// ever gained one, which is what made the drift silent. Unnesting the bar carry also fixes a
+// second case the nesting hid: a beat already past the end of the bar (a meter that just got
+// shorter) never rolled over while the tick happened not to overflow.
+//
+// For the MIDI clock path this is exactly equivalent to the old code: clocksPerBeat = 96/D is
+// >= 3 for every legal D, so the advance is only ever 0 or 1.
 void updateBBT(int32_t &bar, int32_t &beat, double &tick, double ticks_per_beat,
                int beats_per_bar) {
+  // Both are validated on the way in, but this is the RT thread and a zero would turn the
+  // division below into UB rather than the NaN the old fmod would have produced.
+  if (ticks_per_beat <= 0.0 || beats_per_bar <= 0)
+    return;
   if (tick >= ticks_per_beat) {
-    beat += 1;
-    tick = std::fmod(tick, ticks_per_beat);
-    if (beat >= beats_per_bar) {
-      beat = beat % beats_per_bar;
-      bar += 1;
-    }
+    const double beatsAdvanced = std::floor(tick / ticks_per_beat);
+    beat += static_cast<int32_t>(beatsAdvanced);
+    tick -= beatsAdvanced * ticks_per_beat;
+  }
+  if (beat >= beats_per_bar) {
+    bar += beat / beats_per_bar;
+    beat = beat % beats_per_bar;
   }
 }
 
@@ -614,6 +676,20 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
       // report?
     }
   }
+
+  // Refresh the derived Link quantum from the live time signature. timeBaseCallback does this
+  // too, but it doesn't run while the transport is stopped -- and the Link calls below (the
+  // transport-start beat request in particular) have to use the meter that is current *now*,
+  // not the one in force the last time the transport rolled. Same (RT) thread either way.
+  mQuantum = linkQuantumFromState();
+  // A meter change staged from the OSC thread leaves the clock's last-emitted-BBT cache
+  // describing the old meter; drop it here, on the thread that owns those members. Deliberately
+  // NOT a resync (no NeedsSync, no Stop): a meter change doesn't move beat phase, so the clocks
+  // keep landing on the same quarter notes.
+  const bool meterChanged =
+      mNeedsInvalidateClockSyncBBT.exchange(false, std::memory_order_acq_rel);
+  if (meterChanged)
+    invalidateClockSyncBBT();
 
   jack_position_t pos;
 
@@ -685,8 +761,29 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
   jack_midi_clear_buffer(midi_buf);
 
   if (bbtValid) {
-    if (rolling) {
-      const double clocksPerBeat = MIDI_PPQ;
+    // The meter sanity check is part of the condition, not an early return: Link Audio send/receive
+    // runs further down this callback, and bailing out of processCallback here would drop a buffer
+    // of audio to fix a cosmetic clock problem.
+    if (rolling && pos.beat_type > 0.0f && pos.beats_per_bar > 0.0f &&
+        pos.ticks_per_beat > 0.0) {
+      // MIDI clock is 24 pulses per *quarter note*, always. pos.ticks_per_beat counts ticks per
+      // beat_type-note, and one of those is qpb = 4/D quarter notes, so a beat carries
+      // MIDI_PPQ * qpb = 96/D clocks -- an integer for every legal D (1, 2, 4, 8, 16, 32).
+      // This only works because BPM means quarter-notes-per-minute: the qpb in framesPerTick
+      // cancels the one in clocksPerBeat, leaving framesPerClock = 60*sr/(24*bpm) for every
+      // meter. That reduction is the invariant to preserve if anyone touches this.
+      //
+      // The meter comes from `pos`, NOT from mBeatType/mBeatsPerBar, and that is load-bearing.
+      // This block consumes pos.tick / pos.ticks_per_beat / pos.beats_per_minute, all written by
+      // timeBaseCallback -- which runs *after* this callback, so on the cycle an OSC meter change
+      // lands the atomics already hold the new meter while pos.tick still describes the old one.
+      // Reading the atomics here mixed the two: fmod(old tick, new ticksPerClock) snapped the
+      // first clock of that buffer onto the wrong grid and silently dropped a pulse (measured:
+      // one 1933-frame interval where 967 was due). Sourcing the whole block from pos keeps it in
+      // one unit system, and the change simply arrives a cycle later, atomically with the tick
+      // reinterpretation it belongs to.
+      const double qpb = 4.0 / static_cast<double>(pos.beat_type);
+      const double clocksPerBeat = MIDI_PPQ * qpb;
       const double sr = static_cast<double>(jack_get_sample_rate(mJackClient));
 
       int32_t beat = pos.beat - 1;
@@ -694,7 +791,7 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
       double tick = static_cast<double>(pos.tick);
 
       double framesPerTick =
-          60.0 * sr / (pos.ticks_per_beat * pos.beats_per_minute);
+          60.0 * sr * qpb / (pos.ticks_per_beat * pos.beats_per_minute);
       double ticksPerClock = pos.ticks_per_beat / clocksPerBeat;
       double framesPerClock = framesPerTick * ticksPerClock;
 
@@ -707,6 +804,21 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
       tick = tick + offsetTicks;
       const int beatsPerBar = static_cast<int>(pos.beats_per_bar);
       updateBBT(bar, beat, tick, pos.ticks_per_beat, beatsPerBar);
+
+      // clocksPerBeat just changed, so mMIDIClockCount -- clocks elapsed into the current beat --
+      // no longer describes where we are, and the phase check below would read that as lost sync.
+      // Its remedy is a MIDI Stop and a wait for the next downbeat: 0.5-3s of dead clock, measured.
+      // Beat phase doesn't move on a meter change (clocks keep landing on the same quarter notes),
+      // so there is nothing to resync -- only bookkeeping to restate. Because the meter now comes
+      // from pos, this fires on exactly the cycle tick changes meaning, so restating the count is
+      // sufficient and the detector can stay armed.
+      if (clocksPerBeat != mClocksPerBeatLast) {
+        mClocksPerBeatLast = clocksPerBeat;
+        const int cpb = static_cast<int>(clocksPerBeat);
+        if (mMIDIClockRunState == MIDIClockRunState::Running && cpb > 0)
+          mMIDIClockCount = static_cast<int>(std::floor(tick / ticksPerClock)) % cpb;
+      }
+
       double nextClockFrame = offsetTicks * framesPerTick;
 
       // skip dupes
@@ -732,7 +844,8 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
               static_cast<jack_nframes_t>(frame + mClockFrameDelay);
           mClockFrameDelay = 0;
 
-          // verify that we're keeping in sync with 24 clocks per quarter note
+          // verify that we're keeping in sync with 24 clocks per quarter note.
+          //
           bool resync = false;
           if (mMIDIClockCount == 0) {
             resync = tick >= ticksPerClock;
@@ -763,7 +876,7 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
 
           jack_midi_event_write(midi_buf, f, midi_clock_buf.data(),
                                 midi_clock_buf.size());
-          mMIDIClockCount = (mMIDIClockCount + 1) % MIDI_PPQ;
+          mMIDIClockCount = (mMIDIClockCount + 1) % static_cast<int>(clocksPerBeat);
         } else if (beat == 0 && tick < ticksPerClock && tick >= 0 && bar >= 0) {
           // see if we need to send a start
           mMIDIClockRunState = MIDIClockRunState::Running;
@@ -806,9 +919,14 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
 
     // zero out
     std::memset(buf, 0, nframes * sizeof(jack_default_audio_sample_t));
-    if (bbtValid && rolling) {
+    if (bbtValid && rolling && pos.beat_type > 0.0f && pos.beats_per_bar > 0.0f &&
+        pos.ticks_per_beat > 0.0) {
 
-      const double clicksPerBeat = 4;
+      // Same qpb treatment as the MIDI clock path above, so the two builds agree: 4 clicks per
+      // quarter note, and a beat_type-note is qpb = 4/D quarter notes. Sourced from pos for the
+      // same reason, and guarded in the condition so a bad pos can't skip the work below.
+      const double qpb = 4.0 / static_cast<double>(pos.beat_type);
+      const double clicksPerBeat = 4.0 * qpb;
       const double sr = static_cast<double>(jack_get_sample_rate(mJackClient));
 
       int32_t beat = pos.beat - 1;
@@ -816,7 +934,7 @@ int JackTransportLink::processCallback(jack_nframes_t nframes) {
       double tick = static_cast<double>(pos.tick);
 
       double framesPerTick =
-          60.0 * sr / (pos.ticks_per_beat * pos.beats_per_minute);
+          60.0 * sr * qpb / (pos.ticks_per_beat * pos.beats_per_minute);
       double ticksPerClick = pos.ticks_per_beat / clicksPerBeat;
       double framesPerClick = framesPerTick * ticksPerClick;
 
@@ -912,11 +1030,18 @@ void JackTransportLink::timeBaseCallback(jack_transport_state_t transportState,
                                          jack_nframes_t nframes,
                                          jack_position_t *pos, bool posIsNew) {
   auto sessionState = mLink.captureAudioSessionState();
-  bool bbtValid = pos->valid & JackPositionBBT;
 
   double bpm = mBPM.load(std::memory_order_acquire);
-  mQuantum = bbtValid ? pos->beats_per_bar : mInitialQuantum;
-  double ticksPerBeat = bbtValid ? pos->ticks_per_beat : mInitialTicksPerBeat;
+  // jtl is the sole authority for the time signature: it comes from our own state, never read
+  // back out of the pos we were handed (which is what we wrote into it last cycle).
+  const uint32_t ts = mTimeSig.load(std::memory_order_acquire);
+  const int32_t beatsPerBar = timeSigNum(ts);
+  const int32_t beatType = timeSigDen(ts);
+  const double ticksPerBeat = mTicksPerBeat.load(std::memory_order_acquire);
+  // A Link beat is a quarter note, so a bar of N notes of beat_type D is N * 4/D of them.
+  const double qpb = 4.0 / static_cast<double>(beatType);
+  const double quantum = static_cast<double>(beatsPerBar) * qpb;
+  mQuantum = quantum;  // everything handed to Link stays in quarter notes
 
   auto linkTime = mTime;
   const bool sync = mSyncLink.load(std::memory_order_acquire);
@@ -933,11 +1058,11 @@ void JackTransportLink::timeBaseCallback(jack_transport_state_t transportState,
      */
 
     // beat/tick etc after a seek are simply based on frame and the current bpm
+    // ticks_per_beat is deliberately not in this: it cancelled out of the original
+    // (min*bpm*tpb)/tpb, and jtl is the sole authority for BBT -- routing through a field we
+    // ourselves wrote would let another client's reposition inject a value into our beat.
     double min = pos->frame / ((double)pos->frame_rate * 60.0);
-    double abs_tick = min * pos->beats_per_minute * pos->ticks_per_beat;
-    double abs_beat = abs_tick / pos->ticks_per_beat;
-
-    mInternalBeat = abs_beat;
+    mInternalBeat = min * pos->beats_per_minute;
 
     if (sync) {
       if (mLink.numPeers() > 0) {
@@ -972,21 +1097,27 @@ void JackTransportLink::timeBaseCallback(jack_transport_state_t transportState,
     reportedBeat -= (mLatencyMs.load(std::memory_order_acquire) / 1000.0) * (bpm / 60.0);
   }
 
-  // what if quantum changes? Does link keep track of that or should we compute
-  // bar some other way?
-  auto bar = std::floor(reportedBeat / mQuantum);
-  auto beat = std::fmod(reportedBeat, mQuantum);
-  if (beat < 0.0) beat += mQuantum; // keep phase/tick positive through the start-up transient
-  auto tick = trunc(ticksPerBeat * (beat - trunc(beat)));
-  float beatType = bbtValid ? pos->beat_type : mInitialTimeSigDenom;
+  // Bars are derived from the Link session origin (beat 0) and the current quantum, so a meter
+  // change simply re-bars the timeline from that origin rather than continuing the old bar
+  // count. That is what keeps every Link peer agreeing: Link shares only beats and a quantum,
+  // never a bar origin, so a bar number computed any other way would be ours alone.
+  const double barF = std::floor(reportedBeat / quantum);
+  double beatInBarQ = reportedBeat - barF * quantum;  // quarter notes into the bar
+  if (beatInBarQ < 0.0)
+    beatInBarQ += quantum;  // keep phase/tick positive through the start-up transient
+  const double beatInBar = beatInBarQ / qpb;          // in beat_type notes, [0, N)
+  const double beatIdx = std::floor(beatInBar);
+  const double tick = (beatInBar - beatIdx) * ticksPerBeat;
 
   pos->valid = JackPositionBBT;
-  pos->bar = static_cast<int32_t>(bar) + 1;
-  pos->beat = static_cast<int32_t>(beat) + 1;
+  pos->bar = static_cast<int32_t>(barF) + 1;
+  pos->beat = static_cast<int32_t>(beatIdx) + 1;
   pos->tick = static_cast<int32_t>(tick);
-  pos->bar_start_tick = bar * mQuantum * ticksPerBeat;
-  pos->beats_per_bar = static_cast<float>(mQuantum);
-  pos->beat_type = beatType;
+  pos->bar_start_tick = barF * static_cast<double>(beatsPerBar) * ticksPerBeat;
+  // N, the count of beat_type notes in a bar -- NOT the Link quantum (3 for 6/8, where this
+  // reports 6). Downstream applies the 4/beat_type factor itself.
+  pos->beats_per_bar = static_cast<float>(beatsPerBar);
+  pos->beat_type = static_cast<float>(beatType);
   pos->ticks_per_beat = ticksPerBeat;
   pos->beats_per_minute = bpm;
 
@@ -1234,6 +1365,7 @@ std::string JackTransportLink::buildSourceStatusJson() const {
 
 const char* JackTransportLink::stateAddress(StateId id) {
   switch (id) {
+  case StateId::TimeSig:               return state_timesig_address;
   case StateId::Available:             return state_available_address;
   case StateId::Channels:              return state_channels_address;
   case StateId::PeerName:              return state_peer_name_address;
@@ -1261,6 +1393,11 @@ JackTransportLink::StateValue JackTransportLink::buildState(StateId id) {
     return static_cast<float>(1000.0 * static_cast<double>(frames) / sr);
   };
   switch (id) {
+  case StateId::TimeSig:
+  {
+    const uint32_t ts = mTimeSig.load(std::memory_order_acquire);
+    return TimeSigValue{timeSigNum(ts), timeSigDen(ts)};
+  }
   case StateId::Available:
     // Explicit rather than implied: jack_transport_link can run with Link Audio disabled (-A),
     // and over OSC there is no "the channels key isn't readable" tell.
@@ -1302,6 +1439,8 @@ std::string JackTransportLink::encodeState(StateId id, const StateValue& value) 
           return oscBoolMessage(address, v);
         else if constexpr (std::is_same_v<T, float>)
           return oscFloatMessage(address, v);
+        else if constexpr (std::is_same_v<T, TimeSigValue>)
+          return oscIntPairMessage(address, v.first, v.second);
         else
           return oscStringMessage(address, v);
       },
@@ -1331,6 +1470,7 @@ void JackTransportLink::sendState(StateId id) {
   queueOsc(std::move(packet));
 }
 
+void JackTransportLink::sendTimeSig()                 { sendState(StateId::TimeSig); }
 void JackTransportLink::sendLinkAudioAvailable()      { sendState(StateId::Available); }
 void JackTransportLink::sendLinkAudioChannels()       { sendState(StateId::Channels); }
 void JackTransportLink::sendLinkAudioPeerName()       { sendState(StateId::PeerName); }
@@ -1872,6 +2012,12 @@ void JackTransportLink::reconcileSources(const std::vector<DesiredSource>& desir
   mReportLinkAudioSource = true;
 }
 
+double JackTransportLink::linkQuantumFromState() const {
+  const uint32_t ts = mTimeSig.load(std::memory_order_acquire);
+  return static_cast<double>(timeSigNum(ts)) * 4.0 /
+         static_cast<double>(timeSigDen(ts));
+}
+
 void JackTransportLink::invalidateClockSyncBBT() {
   mBeatLast = -1;
   mBarLast = -1;
@@ -1894,6 +2040,26 @@ void JackTransportLink::processOscMessage(
           mReportBPM = true;
         }
       }
+    } else if (std::strcmp("/jacklink/timesig", m.AddressPattern()) == 0) {
+      // Numerator and denominator arrive together, deliberately: two addresses would make
+      // 4/4 -> 3/8 transit through an unintended intermediate meter. Validated as a pair, so a
+      // bad half rejects the whole message and nothing changes.
+      std::optional<int32_t> n, d;
+      if (arg != m.ArgumentsEnd()) n = GetOscInt(*(arg++));
+      if (arg != m.ArgumentsEnd()) d = GetOscInt(*(arg++));
+      if (!n || !d || !validTimeSig(*n, *d)) {
+        std::cerr << "warning: ignoring /jacklink/timesig: expected two integers, "
+                     "beats_per_bar 1-64 and beat_type a power of two 1-32\n";
+      } else {
+        const uint32_t packed = packTimeSig(*n, *d);
+        if (packed != mTimeSig.load(std::memory_order_acquire)) {
+          mTimeSig.store(packed, std::memory_order_release);
+          // The clock's dupe-check cache now describes the old meter; the RT thread drops it.
+          mNeedsInvalidateClockSyncBBT.store(true, std::memory_order_release);
+          mNeedsSaveConfig = true;
+        }
+        mNeedsPublishTimeSig.store(true, std::memory_order_release);
+      }
     } else if (std::strcmp("/jacklink/beattime", m.AddressPattern()) == 0) {
       if (arg != m.ArgumentsEnd()) {
         std::optional<double> v = GetOscDouble(*arg);
@@ -1901,10 +2067,10 @@ void JackTransportLink::processOscMessage(
           jack_position_t pos;
           jack_transport_query(mJackClient, &pos);
 
-          const double tpb = static_cast<double>(pos.ticks_per_beat);
-          double abs_tick = *v * tpb;
-          double minute =
-              abs_tick / (static_cast<double>(pos.beats_per_minute) * tpb);
+          // ticks_per_beat deliberately absent: it cancels (abs_tick/tpb / bpm), and jtl is the
+          // sole authority for BBT -- reading its own output back would let any client's
+          // reposition inject a value here.
+          double minute = *v / static_cast<double>(pos.beats_per_minute);
           pos.frame = minute * static_cast<double>(pos.frame_rate) * 60.0;
 
           jack_transport_reposition(mJackClient, &pos);
@@ -2189,9 +2355,12 @@ void JackTransportLink::saveConfig() {
 
   nlohmann::json cfg;
   cfg["bpm"]               = mBPM.load(std::memory_order_acquire);
-  cfg["quantum"]           = mInitialQuantum;
-  cfg["time_sig_denom"]    = mInitialTimeSigDenom;
-  cfg["ticks_per_beat"]    = mInitialTicksPerBeat;
+  // Key names kept from when these were write-once initial values, so an existing config file
+  // still loads; the values are the live state now, and integers.
+  const uint32_t ts = mTimeSig.load(std::memory_order_acquire);
+  cfg["quantum"]           = timeSigNum(ts);
+  cfg["time_sig_denom"]    = timeSigDen(ts);
+  cfg["ticks_per_beat"]    = mTicksPerBeat.load(std::memory_order_acquire);
   cfg["start_stop_sync"]   = mLink.isStartStopSyncEnabled();
   cfg["sync"] = mSyncLink.load(std::memory_order_acquire);
   cfg["link_audio_enabled"]    = mLinkAudioEnabled;

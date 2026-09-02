@@ -3,6 +3,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -28,10 +29,17 @@
 // without a library fallback lock on each supported target.
 static_assert(std::atomic<bool>::is_always_lock_free);
 static_assert(std::atomic<float>::is_always_lock_free);
+static_assert(std::atomic<double>::is_always_lock_free);
+static_assert(std::atomic<int32_t>::is_always_lock_free);
 static_assert(std::atomic<jack_nframes_t>::is_always_lock_free);
 static_assert(std::atomic<size_t>::is_always_lock_free);
 
 class OscIO;
+
+// A legal time signature: `beatsPerBar` (the numerator, N) is an integer in 1..64 and `beatType`
+// (the denominator, D) an integer power of two in 1..32. Shared by every boundary that can
+// introduce one — the CLI, the config file and the OSC command — so they can't drift apart.
+bool validTimeSig(int32_t beatsPerBar, int32_t beatType);
 
 class JackTransportLink {
 public:
@@ -59,8 +67,8 @@ public:
   JackTransportLink(jack_client_t *client,
                     bool enableStartStopSync = true,
                     double initialBPM = 100.,
-                    double initialQuantum = 4.,
-                    float initialTimeSigDenom = 4.,
+                    int32_t initialBeatsPerBar = 4,
+                    int32_t initialBeatType = 4,
                     double initialTicksPerBeat = 1920.,
                     bool enableLinkAudio = true,
                     bool syncLink = true,
@@ -116,11 +124,16 @@ private:
   // read by the RT process callback) and re-send the read-only latency values.
   void recomputeEffectiveLatency();
 
-  // The Link Audio state push. One row per pushed state address, and the single place any of them
+  // The state push. One row per pushed state address, and the single place any of them
   // is described: buildState() knows how to produce the payload, stateAddress() where it goes,
   // and everything else — the change-guarded senders, the snapshot, the periodic re-publish —
   // iterates this enum. It used to be three hand-maintained lists that had to agree.
+  //
+  // Most rows are Link Audio (/jacklink/state/audio/…), but the enum is not audio-specific:
+  // TimeSig lives under /jacklink/state/transport/. Nothing here assumes the infix — the address
+  // is a per-row string in stateAddress().
   enum class StateId {
+    TimeSig,
     Available,
     Channels,
     PeerName,
@@ -137,9 +150,10 @@ private:
   };
   static constexpr size_t kStateCount = static_cast<size_t>(StateId::Count);
   // The wire type of a state value doubles as the change-guard comparison, so the alternative
-  // chosen here is what decides `bool` vs `float` vs `string` on the wire. Keep the builders
-  // returning the exact alternative each address is documented with.
-  using StateValue = std::variant<bool, float, std::string>;
+  // chosen here is what decides `bool` vs `float` vs `string` vs `ii` on the wire. Keep the
+  // builders returning the exact alternative each address is documented with.
+  using TimeSigValue = std::pair<int32_t, int32_t>;  // (beats_per_bar, beat_type)
+  using StateValue = std::variant<bool, float, std::string, TimeSigValue>;
   static const char* stateAddress(StateId id);
   StateValue buildState(StateId id);
   static std::string encodeState(StateId id, const StateValue& value);
@@ -148,6 +162,7 @@ private:
   // 4 Hz telemetry timer free on an idle device.
   void sendState(StateId id);
   // Named wrappers, so call sites keep saying what they mean.
+  void sendTimeSig();
   void sendLinkAudioAvailable();
   void sendLinkAudioChannels();
   void sendLinkAudioPeerName();
@@ -211,6 +226,10 @@ private:
   void saveConfig();
 
   void invalidateClockSyncBBT();
+
+  // The Link quantum for the live time signature: N notes of beat_type D per bar is
+  // N * 4/D quarter notes, and a Link beat is a quarter note.
+  double linkQuantumFromState() const;
 
   // Queue one already-encoded datagram for sending. Encoding here (under mControlMutex) is
   // correct — it reads guarded state — but the syscall must not happen under the lock, so
@@ -276,6 +295,11 @@ private:
   jack_port_t *mMIDIClockOut = nullptr;
   MIDIClockRunState mMIDIClockRunState = MIDIClockRunState::Stopped;
   int mMIDIClockCount = 0;
+  // The clocksPerBeat this callback last ran with, so the audio thread can notice a meter change
+  // itself. Derived from pos.beat_type like the rest of the clock block, so it changes on exactly
+  // the cycle pos.tick changes meaning -- which is what lets the count simply be restated instead
+  // of the drift detector having to be suppressed.
+  double mClocksPerBeatLast = 0.0;
   // first clock tick gets a delay, track it across process calls
   double mClockFrameDelay = 0;
 
@@ -297,10 +321,27 @@ private:
   std::atomic<float> mBPM;
   std::atomic<double> mLinkBPM;
   double mBPMLast;
+  // The Link quantum, in Link beats (= quarter notes): mBeatsPerBar * 4 / mBeatType. Derived,
+  // never authoritative. Written on the RT thread (processCallback, timeBaseCallback) and read
+  // by the Link calls on that same thread.
   double mQuantum;
-  double mInitialQuantum; // time sig num, called quantum in link
-  float mInitialTimeSigDenom;
-  double mInitialTicksPerBeat;
+  // The authoritative time signature. jtl writes it into every jack_position_t it reports and
+  // never reads it back out of one — the CLI, the config file and /jacklink/timesig are the only
+  // writers. beats_per_bar counts notes of beat_type; BPM stays quarter-notes-per-minute.
+  //
+  // Both halves live in ONE word so the audio thread can never observe a new numerator beside the
+  // old denominator. That pair derives the Link quantum and the whole reported BBT, so a single
+  // cycle of a mismatched meter is exactly the class of one-cycle artifact that already cost a
+  // dropped MIDI clock pulse elsewhere in this file. Two separate atomics cannot give that.
+  std::atomic<uint32_t> mTimeSig;  // (N << 16) | D
+  static constexpr uint32_t packTimeSig(int32_t n, int32_t d) {
+    return (static_cast<uint32_t>(n) << 16) | (static_cast<uint32_t>(d) & 0xFFFFu);
+  }
+  static constexpr int32_t timeSigNum(uint32_t v) { return static_cast<int32_t>(v >> 16); }
+  static constexpr int32_t timeSigDen(uint32_t v) {
+    return static_cast<int32_t>(v & 0xFFFFu);
+  }
+  std::atomic<double> mTicksPerBeat;  // CLI/config only, no OSC control
 
   jack_uuid_t mJackClientUUID;
 
@@ -353,6 +394,14 @@ private:
   std::atomic<bool> mNeedsPublishLatencyMs{false};
   // Same, for the sync-to-incoming-audio toggle.
   std::atomic<bool> mNeedsPublishSyncToIncoming{false};
+  // Same, for the time signature. Required rather than redundant: timeBaseCallback only runs
+  // while the transport rolls or on a reposition, so a meter change made while stopped would
+  // otherwise be invisible to clients until playback started.
+  std::atomic<bool> mNeedsPublishTimeSig{false};
+  // The time signature changed, so the MIDI clock's last-emitted-BBT cache (mBar/mBeat/mTickLast)
+  // now describes the old meter. Set from the OSC thread, drained by processCallback: those three
+  // members belong to the RT thread and must not be written from anywhere else.
+  std::atomic<bool> mNeedsInvalidateClockSyncBBT{false};
 
   // Master Link on/off. When false we call mLink.enable(false), leaving the Link session so
   // peers don't see us at all (also stops tempo sync + Link Audio); jtl keeps running as the

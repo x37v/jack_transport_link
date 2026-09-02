@@ -54,8 +54,10 @@ cpack && sudo dpkg -i *.deb
 ## Running
 
 There are a few options for running the service, setting the initial tempo
-and time signature details, indicating if you want the service to start a
-jack server if there isn't already one to connect to, etc.
+and time signature, indicating if you want the service to start a
+jack server if there isn't already one to connect to, etc. The tempo and the time
+signature are also settable at runtime and persisted, so these only supply the
+starting values — see [Time signature](#time-signature).
 
 Run with the `-h` switch to discover the full option list. Options relevant to the
 control surfaces below:
@@ -67,6 +69,9 @@ control surfaces below:
 | `-o, --osc-port <port>` | UDP port for the OSC interface. Default `3234`, searched upwards over 16 ports; an explicit port is used as given. See [Binding the OSC port](#binding-the-osc-port). |
 | `--no-osc` | Disable OSC entirely (enabled by default). **Also disables the Link Audio bridge**, which is OSC-only. |
 | `--osc-bind-any` | Bind the OSC socket on every interface instead of loopback only. Off by default — see [Binding the OSC port](#binding-the-osc-port). |
+| `-q, --initial-quantum <n>` | Time signature numerator (beats per bar). Integer `1`–`64`, default `4`. See [Time signature](#time-signature). |
+| `-d, --initial-denom <n>` | Time signature denominator (the note value a beat counts). Integer power of two `1`–`32`, default `4`. |
+| `-t, --initial-ticks-per-beat <n>` | Ticks per beat reported in the JACK BBT. Default `1920`. Not settable at runtime. |
 | `-c, --config <path>` | Config file path (see [Config File](#config-file)). |
 | `-s / -S` | Enable / disable transport start-stop sync with Link peers. |
 | `--link / --no-link` | Join / don't join the Link session (default: join). |
@@ -88,8 +93,10 @@ The service is controlled and observed two ways, split by *how often the value c
    property-change callback; read-only keys are published by the service. See the
    [Metadata Reference](#metadata-reference). You must use jack 1.9.13 or newer for metadata
    support — JACK transport doesn't let clients request a tempo, which is why tempo lives here.
-2. **OSC** — everything about **Link Audio**, in both directions, plus imperative equivalents of
-   the transport settings. On by default. See [OSC Control](#osc-control).
+2. **OSC** — everything about **Link Audio**, in both directions, the
+   [time signature](#time-signature) (OSC only — there is no metadata key for it), plus
+   imperative equivalents of the transport settings. On by default. See
+   [OSC Control](#osc-control).
 
 Link Audio is deliberately *not* on metadata. JACK metadata is a disk-backed Berkeley DB and
 every write notifies every connected client whether it cares or not, which is fine for "set the
@@ -119,7 +126,8 @@ JACK client subject. **Access** is `R/W` (client may write; service also publish
 applied value) or `R` (read-only, published by the service). Deleting a writable property
 reverts it to its default where noted.
 
-This is the complete list of *client* keys: everything else moved to [OSC](#osc-control). The
+This is the complete list of *client* keys: everything else — Link Audio and the
+[time signature](#time-signature) — is on [OSC](#osc-control). The
 service also sets [per-port metadata](#per-port-metadata) on its Link Audio ports, whose subject
 is the port rather than the client.
 
@@ -458,8 +466,15 @@ idempotent.
 Sent to every registered listener, one message per datagram (the JSON payloads are easily
 multi-KB, which makes a bundle a bad idea). Booleans are OSC `T`/`F`.
 
+Most of these describe Link Audio and live under `/jacklink/state/audio/`; the time signature is
+transport state and has its own `/jacklink/state/transport/` subtree. It is pushed even when Link
+Audio is off (`-A`), and it is pushed rather than left to the JACK BBT because the timebase
+callback only runs while the transport is rolling — a meter change made while stopped would
+otherwise be invisible until playback started.
+
 | Address | Args | Description |
 |---------|------|-------------|
+| `/jacklink/state/transport/timesig` | `ii` | The live time signature: numerator (beats per bar) then denominator (beat type). See [Time signature](#time-signature). |
 | `/jacklink/state/audio/available` | `bool` | Whether Link Audio is enabled at all (false with `-A`). Explicit, because with no metadata key to be missing there's nothing else to infer it from. |
 | `/jacklink/state/audio/channels` | `s` JSON | Available channels grouped by peer: `[{"peer":…,"channels":[…]}, …]`. |
 | `/jacklink/state/audio/peer-name` | `s` | The *effective* Link peer name being broadcast (override or hostname). |
@@ -496,6 +511,7 @@ The latency values are observation-only; adjust them with the `--capture-latency
 |---------|----------|-------------|
 | `/jacklink/bpm` | `float` or `double` | Set the tempo in beats per minute. |
 | `/jacklink/beattime` | `float` or `double` | Seek the transport to the given beat position. |
+| `/jacklink/timesig` | two numbers (`i`, `f` or `d`, in any combination) | Set the time signature: numerator then denominator. See [Time signature](#time-signature). |
 | `/jacklink/sync` | `bool` | Enable (`true`) / disable (`false`) Link sync (`linksync`). |
 | `/jacklink/rolling` | `bool` | Start (`true`) / stop (`false`) the transport. |
 | `/jacklink/start-stop-sync` | `bool` | Enable / disable transport start/stop sync with Link peers. |
@@ -538,6 +554,46 @@ Note that the identifier is an *argument*, not part of the address: a sink name 
 # /jacklink/audio/source/remove  "Alex's Move" "Cue"
 ```
 
+### Time signature
+
+`jack_transport_link` is the sole authority for the JACK time signature: it writes
+`beats_per_bar`, `beat_type` and `ticks_per_beat` into every position it reports and never reads
+them back out of one. Set it over OSC, and it is persisted to the [config file](#config-file):
+
+```shell
+# 6/8
+oscsend 127.0.0.1 3234 /jacklink/timesig ii 6 8
+```
+
+Both halves go in one message on purpose. Two addresses would make `4/4` → `3/8` transit through
+an unintended intermediate meter, and the pair is validated together — if either half is bad,
+neither is applied.
+
+**What the numbers mean.** `beats_per_bar` (N) counts notes of `beat_type` (D), the usual musical
+reading: `6/8` is six eighth notes to the bar, and `beats_per_bar` reports **6**, not 3. **BPM
+stays quarter-notes-per-minute** and is unaffected by the meter — a Link beat is a quarter note,
+so a bar is `N * 4/D` Link beats, and that (not N) is the quantum shared with Link peers.
+MIDI clock stays 24 pulses per quarter note in every meter.
+
+Bars are counted from the Link session origin, so changing the meter re-bars the timeline from
+that origin rather than continuing the old bar count. That is what keeps every Link peer
+agreeing: Link shares beats and a quantum, never a bar origin. Beat *phase* doesn't move, so a
+meter change never interrupts the MIDI clock.
+
+**Validation**, applied identically wherever a time signature can come from:
+
+* `beats_per_bar` — an integer, `1`–`64`.
+* `beat_type` — an integer power of two, `1`–`32` (1, 2, 4, 8, 16, 32).
+
+A non-integral value (`3.5`) is rejected, not truncated. On the **command line** a bad value is
+fatal, with a message. In the **config file** it warns and falls back to the default — a corrupt
+config must never brick the daemon. Over **OSC** the pair is rejected with one log line and
+nothing changes; the current value is then re-pushed on
+`/jacklink/state/transport/timesig`, so a client's view self-corrects.
+
+`ticks_per_beat` is deliberately *not* on this interface: it's a reporting resolution, not a
+musical setting, and only `-t` / the config file set it.
+
 **No delete-reverts-to-default.** The old metadata keys had one: removing `linkaudio/latency`
 snapped it back to 100 ms, removing `linkaudio/peer-name` reverted to the hostname, removing
 either list emptied it. OSC has no analogue of "unset a value" and that behaviour is simply gone —
@@ -547,6 +603,11 @@ set the default explicitly instead (an empty `peer-name` string still means "use
 
 Settings are persisted to `~/.config/jack-transport-link/config.json` (respects
 `$XDG_CONFIG_HOME`). Override with `-c <path>`. CLI flags take precedence over config values.
+
+`quantum` and `time_sig_denom` are the live time signature numerator and denominator (the key
+names predate `/jacklink/timesig` and are kept so existing config files still load); they are
+written as integers, and a value that isn't a legal [time signature](#time-signature) is warned
+about and ignored on load.
 
 Saved fields: `bpm`, `quantum`, `time_sig_denom`, `ticks_per_beat`, `start_stop_sync`,
 `sync`, `link_enabled`, `link_audio_enabled`, `sinks`, `sources`, `link_peer_name`,

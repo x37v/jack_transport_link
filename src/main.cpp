@@ -3,6 +3,7 @@
 
 #include <OptionParser.h>
 #include <chrono>
+#include <cmath>
 #include <csignal>
 #include <filesystem>
 #include <fstream>
@@ -117,17 +118,19 @@ int main(int argc, char *argv[]) {
       .action("store")
       .dest("bpm")
       .set_default("100.0");
+  // -q/-d keep their historical names and their `double` parse for back-compat, but a time
+  // signature is integral: a non-integral value (3.5) is rejected below, not truncated.
   parser.add_option("-q", "--initial-quantum")
       .type("double")
-      .help("the initial quantum (time signature numerator) to set the "
-            "transport to, if it isn't already set, default: %default")
+      .help("the time signature numerator (beats per bar, counted in notes of the "
+            "denominator); integer 1-64, default: %default")
       .action("store")
       .dest("quantum")
       .set_default("4.0");
   parser.add_option("-d", "--initial-denom")
       .type("double")
-      .help("the initial time signature denominator to set the transport to, "
-            "if it isn't already set, default: %default")
+      .help("the time signature denominator (the note value a beat counts); integer "
+            "power of two 1-32, default: %default")
       .action("store")
       .dest("denom")
       .set_default("4.0");
@@ -260,11 +263,62 @@ int main(int argc, char *argv[]) {
       : configValue(cfg, "start_stop_sync",
                     (bool)options.get("start_stop_sync"));
   double initialBPM        = cfgDouble("bpm",     100.0);
-  double initialQuantum    = cfgDouble("quantum",   4.0);
-  float  initialTimeSigDenom = options.is_set_by_user("denom")
-      ? (float)(double)options.get("denom")
-      : (float)configValue(cfg, "time_sig_denom",
-                           (double)options.get("denom"));
+  // -q/-d parse as doubles (see above); pull them out as integers, rejecting anything that
+  // isn't exactly one.
+  auto cliInt = [&](const char* key) -> std::optional<int32_t> {
+    const double v = (double)options.get(key);
+    if (!std::isfinite(v) || v != std::floor(v) ||
+        v < static_cast<double>(INT32_MIN) || v > static_cast<double>(INT32_MAX))
+      return std::nullopt;
+    return static_cast<int32_t>(v);
+  };
+  const std::optional<int32_t> cliBeatsPerBar = cliInt("quantum");
+  const std::optional<int32_t> cliBeatType    = cliInt("denom");
+  if (!cliBeatsPerBar || !cliBeatType) {
+    std::cerr << "the time signature must be whole numbers: -q/--initial-quantum and "
+                 "-d/--initial-denom" << std::endl;
+    return -1;
+  }
+  // A bad *CLI* time signature is fatal -- the user asked for something impossible and should
+  // hear about it. Validated as a pair, before the config tier, so the config fallback below
+  // always has a legal pair to fall back to.
+  if (!validTimeSig(*cliBeatsPerBar, *cliBeatType)) {
+    std::cerr << "invalid time signature " << *cliBeatsPerBar << "/" << *cliBeatType
+              << ": -q/--initial-quantum must be 1-64 and -d/--initial-denom a power of two "
+                 "in 1-32" << std::endl;
+    return -1;
+  }
+  // Read the config values as doubles and check integrality ourselves. configValue<int32_t> would
+  // let nlohmann truncate a JSON 3.5 to 3 *before* validTimeSig ever sees it, so a fractional
+  // config value would silently become a valid-looking meter instead of being rejected -- which
+  // is both surprising and contrary to what the README promises.
+  auto cfgMeter = [&](const char* key, int32_t fallback) -> int32_t {
+    const double v = configValue<double>(cfg, key, static_cast<double>(fallback));
+    // Same bounds as cliInt above, and for the same reason: a finite, integral, but enormous JSON
+    // number (1e100) passes the first two tests and then makes the cast undefined behaviour.
+    if (!std::isfinite(v) || std::trunc(v) != v ||
+        v < static_cast<double>(INT32_MIN) || v > static_cast<double>(INT32_MAX)) {
+      std::cerr << "warning: config \"" << key << "\" must be a whole number in int32 range, got "
+                << v << "; using " << fallback << "\n";
+      return fallback;
+    }
+    return static_cast<int32_t>(v);
+  };
+  int32_t initialBeatsPerBar = options.is_set_by_user("quantum")
+      ? *cliBeatsPerBar
+      : cfgMeter("quantum", *cliBeatsPerBar);
+  int32_t initialBeatType = options.is_set_by_user("denom")
+      ? *cliBeatType
+      : cfgMeter("time_sig_denom", *cliBeatType);
+  // A bad *config* time signature is not fatal: a corrupt or hand-edited config file must never
+  // brick the daemon, so warn and fall back to the CLI/default pair validated above.
+  if (!validTimeSig(initialBeatsPerBar, initialBeatType)) {
+    std::cerr << "warning: config time signature " << initialBeatsPerBar << "/"
+              << initialBeatType << " is invalid, using " << *cliBeatsPerBar << "/"
+              << *cliBeatType << "\n";
+    initialBeatsPerBar = *cliBeatsPerBar;
+    initialBeatType = *cliBeatType;
+  }
   double initialTicksPerBeat = options.is_set_by_user("ticks")
       ? (double)options.get("ticks")
       : configValue(cfg, "ticks_per_beat", (double)options.get("ticks"));
@@ -333,8 +387,7 @@ int main(int argc, char *argv[]) {
       : configValue(cfg, "link_enabled",
                     (bool)options.get("link_enabled"));
 
-  if (initialBPM <= 0.0 || initialQuantum < 1.0 || initialTimeSigDenom < 1.0 ||
-      initialTicksPerBeat < 1.0) {
+  if (initialBPM <= 0.0 || initialTicksPerBeat < 1.0) {
     std::cerr << "one or more numeric options are out of range" << std::endl;
     return -1;
   }
@@ -383,7 +436,7 @@ int main(int argc, char *argv[]) {
       runSession.store(true);
       jack_on_shutdown(client, shutdown_handler, nullptr);
       JackTransportLink j(client, enableStartStopSync, initialBPM,
-                          initialQuantum, initialTimeSigDenom,
+                          initialBeatsPerBar, initialBeatType,
                           initialTicksPerBeat,
                           enableLinkAudio,
                           initialSyncLink, configPath,
