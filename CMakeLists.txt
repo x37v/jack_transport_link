@@ -113,7 +113,16 @@ if (LINUX)
     SET(CPACK_PACKAGE_CONTACT "alex@x37v.info")
     SET(CPACK_DEBIAN_PACKAGE_HOMEPAGE "https://github.com/x37v/jack_transport_link")
 
-    SET(CPACK_DEBIAN_PACKAGE_VERSION "${PROJECT_VERSION}")
+    #A prerelease, like beta.1, makes the package version 0.0.14~beta.1-1, the tilde sorts it before the final 0.0.14-1
+    set(JTL_PRERELEASE "" CACHE STRING "optional prerelease identifier, like beta.1, appended to the debian package version as ~beta.1")
+    if (JTL_PRERELEASE AND NOT JTL_PRERELEASE MATCHES "^[A-Za-z0-9.]+$")
+      message(FATAL_ERROR "JTL_PRERELEASE must only contain letters, digits and dots, found '${JTL_PRERELEASE}'")
+    endif()
+    if (JTL_PRERELEASE)
+      SET(CPACK_DEBIAN_PACKAGE_VERSION "${PROJECT_VERSION}~${JTL_PRERELEASE}")
+    else()
+      SET(CPACK_DEBIAN_PACKAGE_VERSION "${PROJECT_VERSION}")
+    endif()
 
     #https://github.com/Kitware/CMake/blob/70413d2c3501fe229e9b2d46c745aca5c9f2dc4a/Modules/Internal/CPack/CPackDeb.cmake#L451-L463
     if (NOT CPACK_DEBIAN_PACKAGE_ARCHITECTURE)
